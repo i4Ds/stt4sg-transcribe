@@ -172,3 +172,5 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+test/*
+whisper-large-v3-srg-v2-full-mc-de-sg-corpus/*
