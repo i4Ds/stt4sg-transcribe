@@ -125,6 +125,7 @@ if __name__ == "__main__":
     # Model path can either be a repository on huggingface, a model version or a path to a local model folder
     MODEL_PATH = "whisper-large-v3-srg-v2-full-mc-de-sg-corpus"
     # Folder path is the folder where the media files are located. It will find all media files in the folder (including subfolders)
+    # If it's a local model, the folder has to contain the model.bin, vocab files, config files etc. 
     FOLDER_PATH = "test"
 
 
