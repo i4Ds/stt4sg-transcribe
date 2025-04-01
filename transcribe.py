@@ -31,13 +31,19 @@ class AudioTranscriber:
     def __init__(
         self,
         transcribe_model="large-v3",
-        align_model=None,
         language="de",
+        align_model=None,
         device=None,
+        compute_type=None,
         sr_rate=16000,
     ):
         self.device = (
             device if device else "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        self.compute_type = (
+            compute_type
+            if compute_type
+            else "float16" if self.device == "cuda" else "float32"
         )
         self.transcribe_model = whisperx.load_model(
             transcribe_model,
@@ -46,12 +52,11 @@ class AudioTranscriber:
                 "beam_size": 5,
                 "best_of": 5,
                 "log_prob_threshold": -1.0,
-                "condition_on_previous_text": True,
             },
         )
         # Handle 128 mel spectrogram for v3
         if "v3" in transcribe_model:
-            self.transcribe_model.model.feat_kwargs['feature_size'] = 128
+            self.transcribe_model.model.feat_kwargs["feature_size"] = 128
         self.language = language
         self.align_model, self.metadata = (
             align_model
@@ -117,13 +122,25 @@ class AudioTranscriber:
 
 
 if __name__ == "__main__":
-    at = AudioTranscriber(transcribe_model="whisper-large-v3-srg-v2-full-mc-de-sg-corpus", device="cuda" if torch.cuda.is_available() else "cpu")
-    folder_path = f"test"  # Update this to your target folder
+    # Model path can either be a repository on huggingface, a model version or a path to a local model folder
+    MODEL_PATH = "whisper-large-v3-srg-v2-full-mc-de-sg-corpus"
+    # Folder path is the folder where the media files are located. It will find all media files in the folder (including subfolders)
+    FOLDER_PATH = "test"
 
-    print(f"Processing folder: {folder_path}")
+
+    # ----------------------------------------------------------------
+    # Initialize the transcriber
+    at = AudioTranscriber(
+        transcribe_model="whisper-large-v3-srg-v2-full-mc-de-sg-corpus",
+        device="cuda" if torch.cuda.is_available() else "cpu",
+    )
+
+    # ----------------------------------------------------------------
+    # Process the folder
+    print(f"Processing folder: {FOLDER_PATH}")
     # Find all media files in the folder (including subfolders)
     media_files = []
-    for file_path in glob.iglob(os.path.join(folder_path, "**"), recursive=True):
+    for file_path in glob.iglob(os.path.join(FOLDER_PATH, "**"), recursive=True):
         if os.path.isfile(file_path):
             mime_type, _ = mimetypes.guess_type(file_path)
             if mime_type and mime_type.startswith(("audio/", "video/")):
