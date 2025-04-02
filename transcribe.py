@@ -107,6 +107,7 @@ class AudioTranscriber:
             )
 
         self.pysubs2 = pysubs2.load_from_whisper(self.transcription_result["segments"])
+        self.text = " ".join([segment["text"] for segment in self.transcription_result["segments"]])
 
     def save_subs_to_srt(self, srt_path):
         if self.transcription_result is None:
@@ -119,6 +120,12 @@ class AudioTranscriber:
             raise Exception("Nothing to save. Did you transcribe?")
 
         return self.pysubs2.to_string(format_="srt")
+    
+    def save_as_txt(self, txt_path):
+        if self.transcription_result is None:
+            raise Exception("Nothing to save. Did you transcribe?")
+        with open(txt_path, "w") as f:
+            f.write(self.transcription_result["text"])
 
 
 if __name__ == "__main__":
