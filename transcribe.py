@@ -46,9 +46,12 @@ class AudioTranscriber:
             else "float16" if self.device == "cuda" else "float32"
         )
         self.transcribe_model = whisperx.load_model(
-            transcribe_model,
-            self.device,
-            asr_options={
+            whisper_arch=transcribe_model,
+            device=self.device,
+            device_index=0,
+            compute_type=self.compute_type,
+            asr_options=
+            {
                 "beam_size": 5,
                 "best_of": 5,
                 "log_prob_threshold": -1.0,
@@ -125,7 +128,7 @@ class AudioTranscriber:
         if self.transcription_result is None:
             raise Exception("Nothing to save. Did you transcribe?")
         with open(txt_path, "w") as f:
-            f.write(self.transcription_result["text"])
+            f.write(self.text)
 
 
 if __name__ == "__main__":
