@@ -190,7 +190,7 @@ class PyAnnoteDiarization:
             logger.info("Loading PyAnnote diarization pipeline...")
             self._pipeline = Pipeline.from_pretrained(
                 "pyannote/speaker-diarization-3.1",
-                use_auth_token=self.use_auth_token
+                token=self.use_auth_token
             )
             self._pipeline.to(torch.device(self.device))
             logger.info("PyAnnote diarization pipeline loaded successfully")

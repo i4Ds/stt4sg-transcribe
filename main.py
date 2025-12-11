@@ -24,8 +24,8 @@ def main():
 Examples:
   python main.py audio.mp3
   python main.py audio.mp3 -l de -o output.srt
-  python main.py audio.mp3 --no-diarization
-  python main.py audio.mp3 -n 2 -m medium
+  python main.py audio.mp3 --vad
+  python main.py audio.mp3 --diarization -n 2 -m medium
         """
     )
     
@@ -36,8 +36,8 @@ Examples:
     parser.add_argument("--task", choices=["transcribe", "translate"], default="transcribe")
     
     diar = parser.add_argument_group("Diarization")
-    diar.add_argument("--no-diarization", action="store_true", help="Disable speaker diarization")
-    diar.add_argument("--no-vad", action="store_true", help="Disable VAD")
+    diar.add_argument("--vad", action="store_true", help="Enable VAD (off by default)")
+    diar.add_argument("--diarization", action="store_true", help="Enable speaker diarization (implies --vad)")
     diar.add_argument("-n", "--num-speakers", type=int, help="Number of speakers")
     diar.add_argument("--min-speakers", type=int)
     diar.add_argument("--max-speakers", type=int)
@@ -70,8 +70,8 @@ Examples:
         whisper_model=args.model,
         language=args.language,
         task=args.task,
-        use_vad=not args.no_vad,
-        use_diarization=not args.no_diarization and not args.no_vad,
+        use_vad=args.vad or args.diarization,
+        use_diarization=args.diarization,
         num_speakers=args.num_speakers,
         min_speakers=args.min_speakers,
         max_speakers=args.max_speakers,

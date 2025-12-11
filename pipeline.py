@@ -121,15 +121,19 @@ class TranscriptionPipeline:
         
         # Step 2: Transcription
         logger.info("Step 2: Transcription...")
-        clip_timestamps = diarization_result.get_clip_timestamps() if diarization_result and diarization_result.segments else None
-        if clip_timestamps:
-            logger.info(f"Using {len(diarization_result.segments)} speech segments")
+        transcribe_kwargs = {
+            "language": self.config.language,
+            "task": self.config.task,
+            "beam_size": self.config.beam_size,
+            "word_timestamps": self.config.word_timestamps,
+        }
+        if diarization_result and diarization_result.segments:
+            clip_timestamps = diarization_result.get_clip_timestamps()
+            if clip_timestamps:
+                transcribe_kwargs["clip_timestamps"] = clip_timestamps
+                logger.info(f"Using {len(diarization_result.segments)} speech segments")
         
-        segments_gen, info = self.whisper_model.transcribe(
-            str(audio_path), language=self.config.language, task=self.config.task,
-            beam_size=self.config.beam_size, word_timestamps=self.config.word_timestamps,
-            clip_timestamps=clip_timestamps
-        )
+        segments_gen, info = self.whisper_model.transcribe(str(audio_path), **transcribe_kwargs)
         
         segments = []
         for seg in segments_gen:
