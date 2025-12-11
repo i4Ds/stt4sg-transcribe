@@ -1,6 +1,129 @@
-# WhisperX Transcription Tool
+# STT4SG Transcribe
 
-This tool uses WhisperX to transcribe all audio and video files in a folder. Additionally, it offers a guide for installation and CUDA and CUDNN version management.
+Speech-to-Text transcription tool for Swiss German and other languages using:
+- **Faster-Whisper** for fast ASR transcription
+- **PyAnnote** for Voice Activity Detection (VAD) and speaker diarization
+- **CTC Forced Alignment** for word-level timestamps using wav2vec2 models
+
+## Features
+
+- 🎤 **Speaker Diarization**: Automatically identify different speakers in audio
+- 📝 **Word-level Timestamps**: Precise timing for each word via CTC alignment
+- 🔊 **Voice Activity Detection**: Segment audio by speech regions
+- 📊 **Detailed Logging**: Comprehensive logs for avg_logprob, alignment scores, speaker info
+- 🎬 **SRT Output**: Standard subtitle format with optional speaker labels
+
+## Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/i4Ds/stt4sg-transcribe
+cd stt4sg-transcribe
+
+# Create virtual environment with uv
+uv venv
+source .venv/bin/activate
+
+# Install dependencies
+uv sync
+```
+
+### PyAnnote Authentication
+
+PyAnnote models require a HuggingFace token. Set the `HF_TOKEN` environment variable:
+
+```bash
+export HF_TOKEN="your-huggingface-token"
+```
+
+Or pass it via `--hf-token` argument.
+
+## Usage
+
+### Basic Usage
+
+```bash
+# Transcribe with default settings (auto language detection)
+python main.py audio.mp3
+
+# Specify language
+python main.py audio.mp3 -l de
+
+# Custom output path
+python main.py audio.mp3 -o output.srt
+```
+
+### Options
+
+```bash
+# Disable speaker diarization
+python main.py audio.mp3 --no-diarization
+
+# Disable CTC alignment
+python main.py audio.mp3 --no-alignment
+
+# Specify number of speakers
+python main.py audio.mp3 -n 2
+
+# Use a specific Whisper model
+python main.py audio.mp3 -m medium
+
+# Use CPU instead of GPU
+python main.py audio.mp3 --device cpu
+```
+
+### Full Options
+
+```
+usage: main.py [-h] [-o OUTPUT] [-m MODEL] [-l LANGUAGE] [--task {transcribe,translate}]
+               [--no-diarization] [--no-vad] [-n NUM_SPEAKERS] [--min-speakers MIN_SPEAKERS]
+               [--max-speakers MAX_SPEAKERS] [--no-alignment] [--alignment-model ALIGNMENT_MODEL]
+               [--device {cuda,cpu}] [--compute-type {float16,float32,int8}]
+               [--no-speaker-labels] [--max-line-length MAX_LINE_LENGTH]
+               [--max-segment-duration MAX_SEGMENT_DURATION] [--no-logs] [--hf-token HF_TOKEN]
+               audio_path
+```
+
+## Output Files
+
+### SRT Output
+- Default: `outputs/srt/<filename>.srt`
+- Custom path via `-o` argument
+
+### Log Files
+All logs are saved in `logs/timestamps/` with timestamps:
+- `*_vad_diarization.json`: Speech segments and speaker info
+- `*_transcription.json`: Transcription with avg_logprob, no_speech_prob
+- `*_alignment.json`: Word-level timestamps with alignment confidence scores
+- `*_speaker_alignment.json`: Speaker assignments per segment
+
+## Pipeline Steps
+
+1. **VAD/Diarization** (PyAnnote): Detect speech segments and identify speakers
+2. **Transcription** (Faster-Whisper): Transcribe using speech segment timestamps
+3. **CTC Alignment** (wav2vec2): Generate word-level timestamps
+4. **Speaker Assignment**: Map speakers to transcript segments
+5. **SRT Generation**: Create subtitle file with speaker labels
+
+## Programmatic Usage
+
+```python
+from pipeline import TranscriptionPipeline, TranscriptionConfig
+
+config = TranscriptionConfig(
+    whisper_model="large-v3",
+    language="de",
+    use_diarization=True,
+    use_alignment=True,
+)
+
+pipeline = TranscriptionPipeline(config)
+result = pipeline.transcribe("audio.mp3")
+
+print(result["srt_content"])
+```
+
+---
 
 
 # CUDA / cuDNN Setup Guide
