@@ -136,8 +136,14 @@ class TranscriptionPipeline:
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         base_name = audio_path.stem
         
+        output_path = Path(output_path) if output_path else None
+
         # Create run-specific log folder
-        run_log_dir = Path("logs/timestamps") / f"{base_name}_{run_id}"
+        if output_path:
+            output_root = output_path.parent
+            run_log_dir = output_root / "logs" / f"{base_name}_{run_id}"
+        else:
+            run_log_dir = Path("logs/timestamps") / f"{base_name}_{run_id}"
         if save_logs:
             run_log_dir.mkdir(parents=True, exist_ok=True)
         
@@ -233,7 +239,7 @@ class TranscriptionPipeline:
         
         # Step 5: Generate SRT
         logger.info("Step 5: Generating SRT...")
-        output_path = Path(output_path) if output_path else self.output_dir / f"{base_name}.srt"
+        output_path = output_path if output_path else self.output_dir / f"{base_name}.srt"
         srt_content = segments_to_srt(final_segments, output_path, include_speaker=self.config.include_speaker_labels and self.config.use_diarization)
         results["srt_path"] = str(output_path)
         results["srt_content"] = srt_content
