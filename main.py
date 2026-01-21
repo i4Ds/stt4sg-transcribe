@@ -18,13 +18,13 @@ logger = logging.getLogger(__name__)
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Transcribe audio with speaker diarization and word-level alignment",
+        description="Transcribe audio with optional speaker diarization and word-level alignment",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python main.py audio.mp3
   python main.py audio.mp3 -l de -o output.srt
-  python main.py audio.mp3 --vad
+  python main.py audio.mp3 --no-vad
   python main.py audio.mp3 --diarization -n 2 -m medium
         """
     )
@@ -36,8 +36,8 @@ Examples:
     parser.add_argument("--task", choices=["transcribe", "translate"], default="transcribe")
     
     diar = parser.add_argument_group("Diarization")
-    diar.add_argument("--vad", action="store_true", help="Enable VAD (off by default)")
-    diar.add_argument("--diarization", action="store_true", help="Enable speaker diarization (implies --vad)")
+    diar.add_argument("--no-vad", dest="vad", action="store_false", help="Disable VAD (on by default)")
+    diar.add_argument("--diarization", action="store_true", help="Enable speaker diarization (implies VAD)")
     diar.add_argument("-n", "--num-speakers", type=int, help="Number of speakers")
     diar.add_argument("--min-speakers", type=int)
     diar.add_argument("--max-speakers", type=int)
@@ -90,7 +90,11 @@ Examples:
     
     logger.info(f"Transcribing: {audio_path}")
     logger.info(f"Model: {config.whisper_model}, Device: {config.device}")
-    logger.info(f"Diarization: {'on' if config.use_diarization else 'off'}, Alignment: {'on' if config.use_alignment else 'off'}")
+    logger.info(
+        f"VAD: {'on' if config.use_vad else 'off'}, "
+        f"Diarization: {'on' if config.use_diarization else 'off'}, "
+        f"Alignment: {'on' if config.use_alignment else 'off'}"
+    )
     
     try:
         pipeline = TranscriptionPipeline(config)

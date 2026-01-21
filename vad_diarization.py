@@ -16,7 +16,6 @@ import numpy as np
 import torch
 from pyannote.audio import Pipeline, Model
 from pyannote.audio.pipelines import VoiceActivityDetection
-from pyannote.core import Annotation, Segment, Timeline
 
 logger = logging.getLogger(__name__)
 
@@ -228,7 +227,8 @@ class PyAnnoteDiarization:
         if max_speakers is not None:
             kwargs["max_speakers"] = max_speakers
         
-        diarization: Annotation = pipeline(str(audio_path), **kwargs)
+        diarization_output = pipeline(str(audio_path), **kwargs)
+        diarization = diarization_output.speaker_diarization
         
         # Convert to SpeechSegment objects with speaker labels
         segments = []

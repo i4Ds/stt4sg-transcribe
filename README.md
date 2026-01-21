@@ -43,7 +43,7 @@ Or pass it via `--hf-token` argument.
 ### Basic Usage
 
 ```bash
-# Transcribe with default settings (auto language detection)
+# Transcribe with default settings (VAD on, diarization off)
 python main.py audio.mp3
 
 # Specify language
@@ -56,14 +56,17 @@ python main.py audio.mp3 -o output.srt
 ### Options
 
 ```bash
-# Disable speaker diarization
-python main.py audio.mp3 --no-diarization
+# Enable speaker diarization
+python main.py audio.mp3 --diarization
+
+# Disable VAD
+python main.py audio.mp3 --no-vad
 
 # Disable CTC alignment
 python main.py audio.mp3 --no-alignment
 
-# Specify number of speakers
-python main.py audio.mp3 -n 2
+# Specify number of speakers (requires diarization)
+python main.py audio.mp3 --diarization -n 2
 
 # Use a specific Whisper model
 python main.py audio.mp3 -m medium
@@ -76,11 +79,10 @@ python main.py audio.mp3 --device cpu
 
 ```
 usage: main.py [-h] [-o OUTPUT] [-m MODEL] [-l LANGUAGE] [--task {transcribe,translate}]
-               [--no-diarization] [--no-vad] [-n NUM_SPEAKERS] [--min-speakers MIN_SPEAKERS]
+               [--no-vad] [--diarization] [-n NUM_SPEAKERS] [--min-speakers MIN_SPEAKERS]
                [--max-speakers MAX_SPEAKERS] [--no-alignment] [--alignment-model ALIGNMENT_MODEL]
                [--device {cuda,cpu}] [--compute-type {float16,float32,int8}]
-               [--no-speaker-labels] [--max-line-length MAX_LINE_LENGTH]
-               [--max-segment-duration MAX_SEGMENT_DURATION] [--no-logs] [--hf-token HF_TOKEN]
+               [--no-speaker-labels] [--no-logs] [--hf-token HF_TOKEN]
                audio_path
 ```
 
@@ -99,7 +101,7 @@ All logs are saved in `logs/timestamps/` with timestamps:
 
 ## Pipeline Steps
 
-1. **VAD/Diarization** (PyAnnote): Detect speech segments and identify speakers
+1. **VAD/Diarization** (PyAnnote): Detect speech segments (diarization only if enabled)
 2. **Transcription** (Faster-Whisper): Transcribe using speech segment timestamps
 3. **CTC Alignment** (wav2vec2): Generate word-level timestamps
 4. **Speaker Assignment**: Map speakers to transcript segments
@@ -113,7 +115,8 @@ from pipeline import TranscriptionPipeline, TranscriptionConfig
 config = TranscriptionConfig(
     whisper_model="large-v3",
     language="de",
-    use_diarization=True,
+    use_vad=True,
+    use_diarization=False,
     use_alignment=True,
 )
 

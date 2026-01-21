@@ -12,21 +12,53 @@ Logs saved to one folder per run in logs/timestamps/<run_id>/
 
 import json
 import logging
-import os
+import tempfile
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 import torch
+from pydub import AudioSegment
 from faster_whisper import WhisperModel
 
 from vad_diarization import CombinedVADDiarization, DiarizationResult, save_vad_diarization_log
-from ctc_alignment import CTCAligner, AlignmentResult, save_alignment_log
+from ctc_alignment import CTCAligner, save_alignment_log
 from srt_formatter import segments_to_srt, save_transcription_log
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def ensure_16k_wav(audio_path: Union[str, Path], target_sr: int = 16000) -> Optional[Path]:
+    """
+    Ensure audio is 16kHz mono WAV for pyannote using pydub.
+
+    Returns a temp WAV path if conversion is needed, otherwise None.
+    """
+    audio_path = Path(audio_path)
+    audio = AudioSegment.from_file(audio_path)
+
+    needs_resample = audio.frame_rate != target_sr
+    needs_mono = audio.channels != 1
+    is_wav = audio_path.suffix.lower() == ".wav"
+
+    if not (needs_resample or needs_mono or not is_wav):
+        logger.info(f"Audio already {target_sr}Hz mono WAV; no resample needed")
+        return None
+
+    temp_dir = Path(tempfile.gettempdir()) / "stt4sg_transcribe"
+    temp_dir.mkdir(exist_ok=True)
+    temp_path = temp_dir / f"{audio_path.stem}_16khz.wav"
+
+    logger.info(f"Resampling to {target_sr}Hz mono WAV: {audio_path} -> {temp_path}")
+    if needs_resample:
+        audio = audio.set_frame_rate(target_sr)
+    if needs_mono:
+        audio = audio.set_channels(1)
+
+    audio.export(temp_path, format="wav")
+    return temp_path
 
 
 @dataclass
@@ -37,7 +69,7 @@ class TranscriptionConfig:
     compute_type: str = "float16" if torch.cuda.is_available() else "float32"
     
     use_vad: bool = True
-    use_diarization: bool = True
+    use_diarization: bool = False
     num_speakers: Optional[int] = None
     min_speakers: Optional[int] = None
     max_speakers: Optional[int] = None
@@ -105,35 +137,49 @@ class TranscriptionPipeline:
         logger.info(f"Starting transcription: {audio_path}")
         results = {"audio_file": str(audio_path), "run_id": run_id, "config": self.config.to_dict()}
         
-        # Step 1: VAD/Diarization
-        diarization_result = None
+        # Resample audio to 16kHz mono WAV for pyannote if needed
+        temp_audio_path = None
+        working_audio_path = audio_path
         if self.config.use_vad or self.config.use_diarization:
-            logger.info("Step 1: VAD/Diarization...")
-            diarization_result = self.vad_diarization.process(
-                audio_path, use_diarization=self.config.use_diarization,
-                num_speakers=self.config.num_speakers, min_speakers=self.config.min_speakers,
-                max_speakers=self.config.max_speakers, vad_min_duration=self.config.vad_min_duration,
-                vad_merge_threshold=self.config.vad_merge_threshold
-            )
-            results["vad_diarization"] = diarization_result.to_dict()
-            if save_logs:
-                save_vad_diarization_log(diarization_result, run_log_dir / "vad_diarization.json", str(audio_path))
+            temp_audio_path = ensure_16k_wav(audio_path, target_sr=16000)
+            if temp_audio_path:
+                working_audio_path = temp_audio_path
         
-        # Step 2: Transcription
-        logger.info("Step 2: Transcription...")
-        transcribe_kwargs = {
-            "language": self.config.language,
-            "task": self.config.task,
-            "beam_size": self.config.beam_size,
-            "word_timestamps": self.config.word_timestamps,
-        }
-        if diarization_result and diarization_result.segments:
-            clip_timestamps = diarization_result.get_clip_timestamps()
-            if clip_timestamps:
-                transcribe_kwargs["clip_timestamps"] = clip_timestamps
-                logger.info(f"Using {len(diarization_result.segments)} speech segments")
-        
-        segments_gen, info = self.whisper_model.transcribe(str(audio_path), **transcribe_kwargs)
+        try:
+            # Step 1: VAD/Diarization
+            diarization_result = None
+            if self.config.use_vad or self.config.use_diarization:
+                logger.info("Step 1: VAD/Diarization...")
+                diarization_result = self.vad_diarization.process(
+                    working_audio_path, use_diarization=self.config.use_diarization,
+                    num_speakers=self.config.num_speakers, min_speakers=self.config.min_speakers,
+                    max_speakers=self.config.max_speakers, vad_min_duration=self.config.vad_min_duration,
+                    vad_merge_threshold=self.config.vad_merge_threshold
+                )
+                results["vad_diarization"] = diarization_result.to_dict()
+                if save_logs:
+                    save_vad_diarization_log(diarization_result, run_log_dir / "vad_diarization.json", str(audio_path))
+            
+            # Step 2: Transcription (use original audio for whisper - it handles any format)
+            logger.info("Step 2: Transcription...")
+            transcribe_kwargs = {
+                "language": self.config.language,
+                "task": self.config.task,
+                "beam_size": self.config.beam_size,
+                "word_timestamps": self.config.word_timestamps,
+            }
+            if diarization_result and diarization_result.segments:
+                clip_timestamps = diarization_result.get_clip_timestamps()
+                if clip_timestamps:
+                    transcribe_kwargs["clip_timestamps"] = clip_timestamps
+                    logger.info(f"Using {len(diarization_result.segments)} speech segments")
+            
+            segments_gen, info = self.whisper_model.transcribe(str(audio_path), **transcribe_kwargs)
+        finally:
+            # Clean up temp file
+            if temp_audio_path and temp_audio_path.exists():
+                temp_audio_path.unlink()
+                logger.debug(f"Cleaned up temp audio: {temp_audio_path}")
         
         segments = []
         for seg in segments_gen:
@@ -234,7 +280,8 @@ def transcribe_file(
     output_path: Optional[Union[str, Path]] = None,
     whisper_model: str = "large-v3",
     language: Optional[str] = None,
-    use_diarization: bool = True,
+    use_vad: bool = True,
+    use_diarization: bool = False,
     num_speakers: Optional[int] = None,
     use_alignment: bool = True,
     hf_token: Optional[str] = None,
@@ -243,7 +290,7 @@ def transcribe_file(
     """Convenience function to transcribe a single audio file."""
     config = TranscriptionConfig(
         whisper_model=whisper_model, language=language,
-        use_diarization=use_diarization, num_speakers=num_speakers,
+        use_vad=use_vad, use_diarization=use_diarization, num_speakers=num_speakers,
         use_alignment=use_alignment, hf_token=hf_token
     )
     if device:
@@ -256,12 +303,13 @@ def transcribe_file(
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Transcribe audio with speaker diarization")
+    parser = argparse.ArgumentParser(description="Transcribe audio with optional speaker diarization")
     parser.add_argument("audio_path", help="Path to audio file")
     parser.add_argument("-o", "--output", help="Output SRT path")
     parser.add_argument("-m", "--model", default="large-v3", help="Whisper model")
     parser.add_argument("-l", "--language", help="Language code")
-    parser.add_argument("--no-diarization", action="store_true")
+    parser.add_argument("--no-vad", dest="vad", action="store_false")
+    parser.add_argument("--diarization", action="store_true")
     parser.add_argument("--no-alignment", action="store_true")
     parser.add_argument("-n", "--num-speakers", type=int)
     parser.add_argument("--hf-token", help="HuggingFace token")
@@ -271,7 +319,7 @@ if __name__ == "__main__":
     
     result = transcribe_file(
         args.audio_path, args.output, args.model, args.language,
-        not args.no_diarization, args.num_speakers, not args.no_alignment,
+        args.vad, args.diarization, args.num_speakers, not args.no_alignment,
         args.hf_token, args.device
     )
     
