@@ -5,6 +5,7 @@ Speech-to-Text using Faster-Whisper + PyAnnote + CTC alignment.
 """
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -31,6 +32,7 @@ Examples:
     
     parser.add_argument("audio_path", help="Path to audio file")
     parser.add_argument("-o", "--output", help="Output SRT path (default: outputs/srt/<filename>.srt)")
+    parser.add_argument("--output-dir", help="Output folder for SRTs (default: outputs/srt)")
     parser.add_argument("-m", "--model", default="large-v3", help="Whisper model (default: large-v3)")
     parser.add_argument("-l", "--language", help="Language code (auto-detect if not specified)")
     parser.add_argument("--task", choices=["transcribe", "translate"], default="transcribe")
@@ -38,6 +40,8 @@ Examples:
     diar = parser.add_argument_group("Diarization")
     diar.add_argument("--no-vad", dest="vad", action="store_false", help="Disable VAD (on by default)")
     diar.add_argument("--diarization", action="store_true", help="Enable speaker diarization (implies VAD)")
+    diar.add_argument("--diarization-method", default="pyannote", help="pyannote | nemo | speechbrain")
+    diar.add_argument("--diarization-params", help="JSON dict of diarization params")
     diar.add_argument("-n", "--num-speakers", type=int, help="Number of speakers")
     diar.add_argument("--min-speakers", type=int)
     diar.add_argument("--max-speakers", type=int)
@@ -66,12 +70,18 @@ Examples:
     
     hf_token = args.hf_token or os.environ.get("HF_TOKEN")
     
+    diar_params = None
+    if args.diarization_params:
+        diar_params = json.loads(args.diarization_params)
+
     config = TranscriptionConfig(
         whisper_model=args.model,
         language=args.language,
         task=args.task,
         use_vad=args.vad or args.diarization,
         use_diarization=args.diarization,
+        diarization_method=args.diarization_method,
+        diarization_params=diar_params,
         num_speakers=args.num_speakers,
         min_speakers=args.min_speakers,
         max_speakers=args.max_speakers,
@@ -96,9 +106,17 @@ Examples:
         f"Alignment: {'on' if config.use_alignment else 'off'}"
     )
     
+    output_path = None
+    if args.output:
+        output_path = Path(args.output)
+    elif args.output_dir:
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"{audio_path.stem}.srt"
+
     try:
         pipeline = TranscriptionPipeline(config)
-        result = pipeline.transcribe(audio_path, args.output, save_logs=not args.no_logs)
+        result = pipeline.transcribe(audio_path, output_path, save_logs=not args.no_logs)
         
         print("\n" + "="*50)
         print("TRANSCRIPTION COMPLETE")

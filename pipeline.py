@@ -16,7 +16,7 @@ import tempfile
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 from pydub import AudioSegment
@@ -70,6 +70,8 @@ class TranscriptionConfig:
     
     use_vad: bool = True
     use_diarization: bool = False
+    diarization_method: str = "pyannote"
+    diarization_params: Optional[Dict[str, Any]] = None
     num_speakers: Optional[int] = None
     min_speakers: Optional[int] = None
     max_speakers: Optional[int] = None
@@ -115,7 +117,12 @@ class TranscriptionPipeline:
     @property
     def vad_diarization(self) -> CombinedVADDiarization:
         if self._vad_diarization is None:
-            self._vad_diarization = CombinedVADDiarization(device=self.config.device, use_auth_token=self.config.hf_token)
+            self._vad_diarization = CombinedVADDiarization(
+                device=self.config.device,
+                use_auth_token=self.config.hf_token,
+                diarization_method=self.config.diarization_method,
+                diarization_params=self.config.diarization_params,
+            )
         return self._vad_diarization
     
     def get_aligner(self, language: str) -> CTCAligner:
@@ -282,6 +289,8 @@ def transcribe_file(
     language: Optional[str] = None,
     use_vad: bool = True,
     use_diarization: bool = False,
+    diarization_method: str = "pyannote",
+    diarization_params: Optional[Dict[str, Any]] = None,
     num_speakers: Optional[int] = None,
     use_alignment: bool = True,
     hf_token: Optional[str] = None,
@@ -290,7 +299,9 @@ def transcribe_file(
     """Convenience function to transcribe a single audio file."""
     config = TranscriptionConfig(
         whisper_model=whisper_model, language=language,
-        use_vad=use_vad, use_diarization=use_diarization, num_speakers=num_speakers,
+        use_vad=use_vad, use_diarization=use_diarization,
+        diarization_method=diarization_method, diarization_params=diarization_params,
+        num_speakers=num_speakers,
         use_alignment=use_alignment, hf_token=hf_token
     )
     if device:
@@ -310,6 +321,8 @@ if __name__ == "__main__":
     parser.add_argument("-l", "--language", help="Language code")
     parser.add_argument("--no-vad", dest="vad", action="store_false")
     parser.add_argument("--diarization", action="store_true")
+    parser.add_argument("--diarization-method", default="pyannote")
+    parser.add_argument("--diarization-params", help="JSON dict of diarization params")
     parser.add_argument("--no-alignment", action="store_true")
     parser.add_argument("-n", "--num-speakers", type=int)
     parser.add_argument("--hf-token", help="HuggingFace token")
@@ -317,9 +330,14 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
+    diar_params = None
+    if args.diarization_params:
+        diar_params = json.loads(args.diarization_params)
+
     result = transcribe_file(
         args.audio_path, args.output, args.model, args.language,
-        args.vad, args.diarization, args.num_speakers, not args.no_alignment,
+        args.vad, args.diarization, args.diarization_method, diar_params,
+        args.num_speakers, not args.no_alignment,
         args.hf_token, args.device
     )
     
