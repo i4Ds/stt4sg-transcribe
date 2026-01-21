@@ -458,9 +458,9 @@ class NemoClusteringDiarization:
                             "speaker_params",
                             {
                                 "save_embeddings": False,
-                                "window_length_in_sec": 1.5,
-                                "shift_length_in_sec": 0.75,
-                                "multiscale_weights": [1.0],
+                                "window_length_in_sec": [1.5, 1.0, 0.5, 0.25],
+                                "shift_length_in_sec": [0.75, 0.5, 0.25, 0.125],
+                                "multiscale_weights": [1.0, 1.0, 1.0, 1.2],
                             },
                         ),
                     },
@@ -470,7 +470,9 @@ class NemoClusteringDiarization:
                             "max_num_speakers": max_spk,
                             "min_num_speakers": min_spk,
                             "max_rp_threshold": 0.25,
-                            "sparse_search_volume": 30,
+                            "sparse_search_volume": 60,
+                            "embeddings_per_chunk": 10000,
+                            "chunk_cluster_count": 80,
                         }
                     },
                 },

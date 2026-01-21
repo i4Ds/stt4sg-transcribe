@@ -43,7 +43,7 @@ Examples:
     diar.add_argument("--diarization-method", default="pyannote", help="pyannote | nemo | speechbrain")
     diar.add_argument("--diarization-params", help="JSON dict of diarization params")
     diar.add_argument("-n", "--num-speakers", type=int, help="Number of speakers")
-    diar.add_argument("--min-speakers", type=int)
+    diar.add_argument("--min-speakers", type=int, default=2)
     diar.add_argument("--max-speakers", type=int)
     
     align = parser.add_argument_group("Alignment")
