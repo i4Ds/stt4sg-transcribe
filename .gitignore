@@ -1,6 +1,6 @@
 logs/*
 test/*
-__pycache__/*
+**__pycache__/
 outputs/*
 stt4sg_transcribe.egg-info/*
 diar_test/*

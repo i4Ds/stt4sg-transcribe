@@ -44,46 +44,89 @@ Or pass it via `--hf-token` argument.
 
 ```bash
 # Transcribe with default settings (VAD on, diarization off)
-python main.py audio.mp3
+uv run main.py audio.mp3
 
 # Specify language
-python main.py audio.mp3 -l de
+uv run main.py audio.mp3 -l de
 
 # Custom output path
-python main.py audio.mp3 -o output.srt
+uv run main.py audio.mp3 -o output.srt
 ```
 
 ### Options
 
 ```bash
 # Enable speaker diarization
-python main.py audio.mp3 --diarization
+uv run main.py audio.mp3 --diarization
 
 # Disable VAD
-python main.py audio.mp3 --no-vad
+uv run main.py audio.mp3 --no-vad
 
 # Disable CTC alignment
-python main.py audio.mp3 --no-alignment
+uv run main.py audio.mp3 --no-alignment
 
 # Specify number of speakers (requires diarization)
-python main.py audio.mp3 --diarization -n 2
+uv run main.py audio.mp3 --diarization -n 2
 
 # Use a specific Whisper model
-python main.py audio.mp3 -m medium
+uv run main.py audio.mp3 -m medium
 
 # Use CPU instead of GPU
-python main.py audio.mp3 --device cpu
+uv run main.py audio.mp3 --device cpu
 ```
 
 ### Full Options
 
 ```
-usage: main.py [-h] [-o OUTPUT] [-m MODEL] [-l LANGUAGE] [--task {transcribe,translate}]
-               [--no-vad] [--diarization] [-n NUM_SPEAKERS] [--min-speakers MIN_SPEAKERS]
-               [--max-speakers MAX_SPEAKERS] [--no-alignment] [--alignment-model ALIGNMENT_MODEL]
+usage: main.py [-h] [-o OUTPUT] [--output-dir OUTPUT_DIR] [-m MODEL] [-l LANGUAGE]
+               [--task {transcribe,translate}] [--log-progress]
+               [--no-vad] [--vad-method VAD_METHOD] [--vad-params VAD_PARAMS]
+               [--diarization] [--diarization-method DIARIZATION_METHOD]
+               [--diarization-params DIARIZATION_PARAMS] [-n NUM_SPEAKERS]
+               [--min-speakers MIN_SPEAKERS] [--max-speakers MAX_SPEAKERS]
+               [--no-alignment] [--alignment-model ALIGNMENT_MODEL]
+               [--batch-size BATCH_SIZE]
                [--device {cuda,cpu}] [--compute-type {float16,float32,int8}]
                [--no-speaker-labels] [--no-logs] [--hf-token HF_TOKEN]
                audio_path
+
+Arguments:
+  audio_path                    Path to audio file
+  -o, --output OUTPUT           Output SRT path (default: outputs/srt/<filename>.srt)
+  --output-dir OUTPUT_DIR       Output folder for SRTs (default: outputs/srt)
+  -m, --model MODEL             Whisper model (default: large-v3)
+  -l, --language LANGUAGE       Language code (auto-detect if not specified)
+  --task {transcribe,translate} Task to perform (default: transcribe)
+  --log-progress                Log transcription progress
+
+Diarization:
+  --no-vad                      Disable VAD (on by default)
+  --vad-method VAD_METHOD       VAD method: pyannote | speechbrain | nemo | silero (default: pyannote)
+  --vad-params VAD_PARAMS       JSON dict of VAD parameters
+  --diarization                 Enable speaker diarization (implies VAD)
+  --diarization-method METHOD   Diarization method: pyannote | nemo | speechbrain (default: pyannote)
+  --diarization-params PARAMS   JSON dict of diarization parameters
+  -n, --num-speakers NUM        Number of speakers
+  --min-speakers MIN            Minimum number of speakers (default: 2)
+  --max-speakers MAX            Maximum number of speakers
+
+Alignment:
+  --no-alignment                Disable CTC alignment
+  --alignment-model MODEL       Custom alignment model
+
+Performance:
+  --batch-size BATCH_SIZE       Batch size for transcription (enables batched inference and **disables** condition_on_previous_text)
+
+Device:
+  --device {cuda,cpu}           Device to use for processing
+  --compute-type TYPE           Compute type: float16 | float32 | int8
+
+Output:
+  --no-speaker-labels           Disable speaker labels in SRT output
+  --no-logs                     Don't save log files
+
+Auth:
+  --hf-token HF_TOKEN           HuggingFace token (or set HF_TOKEN env)
 ```
 
 ## Output Files
@@ -146,58 +189,11 @@ This usually means either:
 ```bash
 export LD_LIBRARY_PATH="$(python3 -c 'import importlib.util,os;pkgs=["nvidia.cublas","nvidia.cudnn"];print(":".join([os.path.join((spec.submodule_search_locations[0] if (spec:=importlib.util.find_spec(p)) and spec.submodule_search_locations else os.path.dirname(spec.origin)),"lib") for p in pkgs]))'):$LD_LIBRARY_PATH"
 ```
+or if you use fish:
 
----
-
-## Installation Methods
-
-### 1. Use NVIDIA Docker
-
-The official NVIDIA CUDA Docker images come with cuBLAS and cuDNN preinstalled:
-
-```
-docker pull nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
-```
-
-### 2. Install with pip (Linux only)
-
-You can install the required libraries directly from PyPI:
-
-```bash
-pip install nvidia-cublas-cu12
-pip install nvidia-cudnn-cu12==9.*
-```
-
-Then add them to your library path:
-
-```bash
-export LD_LIBRARY_PATH="$(python3 -c 'import importlib.util,os;pkgs=["nvidia.cublas","nvidia.cudnn"];print(":".join([os.path.join((spec.submodule_search_locations[0] if (spec:=importlib.util.find_spec(p)) and spec.submodule_search_locations else os.path.dirname(spec.origin)),"lib") for p in pkgs]))'):$LD_LIBRARY_PATH"
-```
-
-### 3. Manual Download
-
-For Windows and Linux, precompiled CUDA/cuDNN archives are available (e.g. from NVIDIA or community distributions).
-Unpack the archive and place the `.so` / `.dll` files in a directory that is part of your `PATH` (Linux) or `%PATH%` (Windows).
-
----
-
-## Notes
-
-* Ensure your CUDA and cuDNN versions match what your PyTorch wheel expects.
-* If libraries are installed but still not found, verify `LD_LIBRARY_PATH` is correctly pointing to their directories.
-* If using cuDNN < 9, some packages (like `ctranslate2`) may require a downgrade.
-
-
-## Install the required Python packages; 
-```bash
-pip install -r requirements.txt
-```
-
-## Usage
-In the `transcribe.py` file, update the `folder_path` variable to the path of the folder containing and pass the model name or path to the `AudioTranscriber` class. Then, run the script:
-```bash
-python transcribe.py
-```
+````fish
+set -x LD_LIBRARY_PATH (python3 -c 'import importlib.util,os;pkgs=["nvidia.cublas","nvidia.cudnn"];print(":".join([os.path.join((spec.submodule_search_locations[0] if (spec:=importlib.util.find_spec(p)) and spec.submodule_search_locations else os.path.dirname(spec.origin)),"lib") for p in pkgs]))') $LD_LIBRARY_PATH
+````
 
 ## Maintainer
 - [@kenfus](https://github.com/kenfus)

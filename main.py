@@ -36,6 +36,7 @@ Examples:
     parser.add_argument("-m", "--model", default="large-v3", help="Whisper model (default: large-v3)")
     parser.add_argument("-l", "--language", help="Language code (auto-detect if not specified)")
     parser.add_argument("--task", choices=["transcribe", "translate"], default="transcribe")
+    parser.add_argument("--log-progress", action="store_true", help="Log transcription progress")
     
     diar = parser.add_argument_group("Diarization")
     diar.add_argument("--no-vad", dest="vad", action="store_false", help="Disable VAD (on by default)")
@@ -51,6 +52,9 @@ Examples:
     align = parser.add_argument_group("Alignment")
     align.add_argument("--no-alignment", action="store_true", help="Disable CTC alignment")
     align.add_argument("--alignment-model", help="Custom alignment model")
+    
+    perf = parser.add_argument_group("Performance")
+    perf.add_argument("--batch-size", type=int, help="Batch size for transcription (enables batched inference)")
     
     device = parser.add_argument_group("Device")
     device.add_argument("--device", choices=["cuda", "cpu"])
@@ -96,6 +100,8 @@ Examples:
         alignment_model=args.alignment_model,
         include_speaker_labels=not args.no_speaker_labels,
         hf_token=hf_token,
+        log_progress=args.log_progress,
+        batch_size=args.batch_size,
     )
     
     if args.device:
