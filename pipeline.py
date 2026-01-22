@@ -20,9 +20,9 @@ from typing import Any, Dict, List, Optional, Union
 
 import torch
 from pydub import AudioSegment
-from faster_whisper import WhisperModel
+from faster_whisper import WhisperModel, BatchedInferencePipeline
 
-from vad_diarization import CombinedVADDiarization, DiarizationResult, save_vad_diarization_log
+from vad_diarization import CombinedVADDiarization, DiarizationResult, save_vad_diarization_log, generate_chunk_timestamps
 from ctc_alignment import CTCAligner, save_alignment_log
 from srt_formatter import segments_to_srt, save_transcription_log
 
@@ -83,7 +83,9 @@ class TranscriptionConfig:
     language: Optional[str] = None
     task: str = "transcribe"
     beam_size: int = 5
+    batch_size: Optional[int] = None
     word_timestamps: bool = True
+    log_progress: bool = False
     
     use_alignment: bool = True
     alignment_model: Optional[str] = None
@@ -115,6 +117,11 @@ class TranscriptionPipeline:
             )
             logger.info("Whisper model loaded")
         return self._whisper_model
+    
+    @property
+    def batched_pipeline(self) -> BatchedInferencePipeline:
+        """Returns a BatchedInferencePipeline wrapping the WhisperModel."""
+        return BatchedInferencePipeline(model=self.whisper_model)
     
     @property
     def vad_diarization(self) -> CombinedVADDiarization:
@@ -184,14 +191,43 @@ class TranscriptionPipeline:
                 "task": self.config.task,
                 "beam_size": self.config.beam_size,
                 "word_timestamps": self.config.word_timestamps,
+                "log_progress": self.config.log_progress,
             }
-            if diarization_result and diarization_result.segments:
-                clip_timestamps = diarization_result.get_clip_timestamps()
-                if clip_timestamps:
-                    transcribe_kwargs["clip_timestamps"] = clip_timestamps
-                    logger.info(f"Using {len(diarization_result.segments)} speech segments")
             
-            segments_gen, info = self.whisper_model.transcribe(str(audio_path), **transcribe_kwargs)
+            use_batched = self.config.batch_size is not None
+            has_segments = diarization_result and diarization_result.segments
+
+            if has_segments:
+                # Batched expects List[dict], non-batched expects List[float]
+                transcribe_kwargs["clip_timestamps"] = (
+                    diarization_result.get_clip_timestamps_dict() if use_batched
+                    else diarization_result.get_clip_timestamps()
+                )
+                logger.info(f"Using {len(diarization_result.segments)} speech segments")
+            elif use_batched:
+                # Batched inference requires clip_timestamps for audio > 30s
+                audio = AudioSegment.from_file(audio_path)
+                duration = len(audio) / 1000.0
+                clip_timestamps = generate_chunk_timestamps(duration)
+                # Trim last chunk slightly to avoid duration mismatch with faster_whisper's calculation
+                clip_timestamps[-1]["end"] = min(
+                    duration,
+                    max(clip_timestamps[-1]["start"] + 0.1, clip_timestamps[-1]["end"] - 0.01)
+                )
+                transcribe_kwargs["clip_timestamps"] = clip_timestamps
+                logger.info(f"Using {len(clip_timestamps)} fixed 30s chunks (no VAD)")
+            else:
+                transcribe_kwargs["vad_filter"] = False
+
+            if use_batched:
+                logger.info(f"Using batched inference with batch_size={self.config.batch_size}")
+                transcribe_kwargs["batch_size"] = self.config.batch_size
+                pipeline = self.batched_pipeline
+            else:
+                pipeline = self.whisper_model
+
+            segments_gen, info = pipeline.transcribe(str(audio_path), **transcribe_kwargs)
+            
         finally:
             # Clean up temp file
             if temp_audio_path and temp_audio_path.exists():
