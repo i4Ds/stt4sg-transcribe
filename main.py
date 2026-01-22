@@ -39,6 +39,8 @@ Examples:
     
     diar = parser.add_argument_group("Diarization")
     diar.add_argument("--no-vad", dest="vad", action="store_false", help="Disable VAD (on by default)")
+    diar.add_argument("--vad-method", default="pyannote", help="pyannote | speechbrain | nemo | silero")
+    diar.add_argument("--vad-params", help="JSON dict of VAD params")
     diar.add_argument("--diarization", action="store_true", help="Enable speaker diarization (implies VAD)")
     diar.add_argument("--diarization-method", default="pyannote", help="pyannote | nemo | speechbrain")
     diar.add_argument("--diarization-params", help="JSON dict of diarization params")
@@ -73,6 +75,9 @@ Examples:
     diar_params = None
     if args.diarization_params:
         diar_params = json.loads(args.diarization_params)
+    vad_params = None
+    if args.vad_params:
+        vad_params = json.loads(args.vad_params)
 
     config = TranscriptionConfig(
         whisper_model=args.model,
@@ -80,6 +85,8 @@ Examples:
         task=args.task,
         use_vad=args.vad or args.diarization,
         use_diarization=args.diarization,
+        vad_method=args.vad_method,
+        vad_params=vad_params,
         diarization_method=args.diarization_method,
         diarization_params=diar_params,
         num_speakers=args.num_speakers,
@@ -101,8 +108,8 @@ Examples:
     logger.info(f"Transcribing: {audio_path}")
     logger.info(f"Model: {config.whisper_model}, Device: {config.device}")
     logger.info(
-        f"VAD: {'on' if config.use_vad else 'off'}, "
-        f"Diarization: {'on' if config.use_diarization else 'off'}, "
+        f"VAD: {'on' if config.use_vad else 'off'} ({config.vad_method}), "
+        f"Diarization: {'on' if config.use_diarization else 'off'} ({config.diarization_method}), "
         f"Alignment: {'on' if config.use_alignment else 'off'}"
     )
     

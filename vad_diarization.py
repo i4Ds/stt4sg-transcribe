@@ -16,6 +16,8 @@ import numpy as np
 import torch
 from pyannote.audio import Pipeline, Model
 from pyannote.audio.pipelines import VoiceActivityDetection
+from faster_whisper.audio import decode_audio
+from faster_whisper.vad import VadOptions, get_speech_timestamps
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +166,130 @@ class PyAnnoteVAD:
         return merged
 
 
+class SileroVAD:
+    """Voice Activity Detection using Silero (via faster-whisper)."""
+
+    def __init__(self, vad_params: Optional[Dict[str, Any]] = None):
+        self.vad_params = vad_params or {}
+
+    def detect_speech(
+        self,
+        audio_path: Union[str, Path],
+        min_duration: float = 0.5,
+        merge_threshold: float = 0.3,
+    ) -> List[SpeechSegment]:
+        audio = decode_audio(str(audio_path), sampling_rate=16000)
+        params = self.vad_params
+        if isinstance(params, VadOptions):
+            vad_options = params
+        else:
+            vad_options = VadOptions(**params) if params else VadOptions()
+
+        speech_timestamps = get_speech_timestamps(audio, vad_options)
+        segments = []
+        for ts in speech_timestamps:
+            start = float(ts["start"]) / 16000.0
+            end = float(ts["end"]) / 16000.0
+            if (end - start) >= min_duration:
+                segments.append(SpeechSegment(start=start, end=end))
+
+        if merge_threshold > 0 and len(segments) > 1:
+            segments = PyAnnoteVAD._merge_close_segments(self, segments, merge_threshold)
+
+        logger.info(f"Detected {len(segments)} speech segments (Silero)")
+        return segments
+
+
+class SpeechBrainVAD:
+    """Voice Activity Detection using SpeechBrain."""
+
+    def __init__(self, device: str, vad_params: Optional[Dict[str, Any]] = None):
+        self.device = device
+        self.params = vad_params or {}
+
+    def detect_speech(
+        self,
+        audio_path: Union[str, Path],
+        min_duration: float = 0.5,
+        merge_threshold: float = 0.3,
+    ) -> List[SpeechSegment]:
+        try:
+            import torchaudio
+            from speechbrain.inference.VAD import VAD
+        except Exception as exc:
+            raise RuntimeError("SpeechBrain VAD requires speechbrain and torchaudio") from exc
+
+        def load_mono_16k(path: Path):
+            wav, sr = torchaudio.load(str(path))
+            if wav.shape[0] > 1:
+                wav = wav.mean(dim=0, keepdim=True)
+            if sr != 16000:
+                wav = torchaudio.functional.resample(wav, sr, 16000)
+                sr = 16000
+            return wav, sr
+
+        audio_path = Path(audio_path)
+        _ = load_mono_16k(audio_path)
+
+        run_device = self.device
+        if run_device == "cuda":
+            try:
+                if not torch.cuda.is_available():
+                    run_device = "cpu"
+            except Exception:
+                run_device = "cpu"
+        run_opts = {"device": run_device} if run_device else None
+
+        vad_model = self.params.get("vad_model", "speechbrain/vad-crdnn-libriparty")
+        vad = VAD.from_hparams(
+            source=vad_model,
+            savedir=self.params.get("vad_savedir", "pretrained_sb_vad"),
+            run_opts=run_opts,
+        )
+        speech_segs = vad.get_speech_segments(
+            str(audio_path),
+            activation_th=self.params.get("vad_threshold", 0.5),
+            deactivation_th=self.params.get("vad_deactivation_th", 0.25),
+            len_th=self.params.get("min_speech_duration", 0.2),
+            close_th=self.params.get("min_silence_duration", 0.2),
+        )
+        if len(speech_segs) == 0:
+            raise RuntimeError("No speech detected by SpeechBrain VAD")
+
+        segments = [SpeechSegment(start=float(s), end=float(e)) for (s, e) in speech_segs]
+        if merge_threshold > 0 and len(segments) > 1:
+            segments = PyAnnoteVAD._merge_close_segments(self, segments, merge_threshold)
+
+        segments = [s for s in segments if s.duration >= min_duration]
+        logger.info(f"Detected {len(segments)} speech segments (SpeechBrain)")
+        return segments
+
+
+class NemoVAD:
+    """Voice Activity Detection using NeMo (via clustering diarizer VAD)."""
+
+    def __init__(self, device: str, vad_params: Optional[Dict[str, Any]] = None):
+        self.device = device
+        self.params = vad_params or {}
+
+    def detect_speech(
+        self,
+        audio_path: Union[str, Path],
+        min_duration: float = 0.5,
+        merge_threshold: float = 0.3,
+    ) -> List[SpeechSegment]:
+        diarizer = NemoClusteringDiarization(device=self.device, diarization_params=self.params)
+        diarization = diarizer.diarize(audio_path, num_speakers=1, min_speakers=1, max_speakers=1)
+        segments = [SpeechSegment(start=s.start, end=s.end) for s in diarization.segments]
+
+        if merge_threshold > 0 and len(segments) > 1:
+            segments = PyAnnoteVAD._merge_close_segments(self, segments, merge_threshold)
+
+        segments = [s for s in segments if s.duration >= min_duration]
+        logger.info(f"Detected {len(segments)} speech segments (NeMo)")
+        return segments
+
+
 class PyAnnoteDiarization:
     """Speaker Diarization using PyAnnote."""
     
@@ -269,6 +395,8 @@ class CombinedVADDiarization:
         self,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         use_auth_token: Optional[str] = None,
+        vad_method: str = "pyannote",
+        vad_params: Optional[Dict[str, Any]] = None,
         diarization_method: str = "pyannote",
         diarization_params: Optional[Dict[str, Any]] = None,
     ):
@@ -281,14 +409,17 @@ class CombinedVADDiarization:
         """
         self.device = device
         self.use_auth_token = use_auth_token
+        self.vad_method = vad_method
+        self.vad_params = vad_params or {}
         self.diarization_method = diarization_method
         self.diarization_params = diarization_params or {}
-        self.vad = PyAnnoteVAD(device=device, use_auth_token=use_auth_token)
+        self._vad_provider = None
         self._diarization_provider = None
     
     def process(
         self,
         audio_path: Union[str, Path],
+        use_vad: bool = True,
         use_diarization: bool = True,
         num_speakers: Optional[int] = None,
         min_speakers: Optional[int] = None,
@@ -301,6 +432,7 @@ class CombinedVADDiarization:
         
         Args:
             audio_path: Path to audio file
+            use_vad: Whether to perform VAD
             use_diarization: Whether to perform speaker diarization
             num_speakers: Exact number of speakers (if known)
             min_speakers: Minimum number of speakers
@@ -311,26 +443,55 @@ class CombinedVADDiarization:
         Returns:
             DiarizationResult with segments (with or without speaker labels)
         """
+        vad_segments = []
+        diar_segments = []
+        num_found_speakers = 0
+
+        if use_vad:
+            vad_provider = self._get_vad_provider()
+            vad_segments = vad_provider.detect_speech(
+                audio_path,
+                min_duration=vad_min_duration,
+                merge_threshold=vad_merge_threshold,
+            )
+
         if use_diarization:
-            # Full diarization (includes VAD internally for most providers)
             provider = self._get_diarization_provider()
-            return provider.diarize(
+            diarization = provider.diarize(
                 audio_path,
                 num_speakers=num_speakers,
                 min_speakers=min_speakers,
                 max_speakers=max_speakers,
             )
+            diar_segments = diarization.segments
+            num_found_speakers = diarization.num_speakers
+
+        if use_vad and use_diarization:
+            segments = self._assign_speakers_to_segments(vad_segments, diar_segments)
+            return DiarizationResult(segments=segments, num_speakers=num_found_speakers)
+
+        if use_vad:
+            return DiarizationResult(segments=vad_segments, num_speakers=0)
+
+        return DiarizationResult(segments=diar_segments, num_speakers=num_found_speakers)
+
+    def _get_vad_provider(self):
+        if self._vad_provider is not None:
+            return self._vad_provider
+
+        method = (self.vad_method or "pyannote").lower()
+        params = self.vad_params or {}
+        if method == "pyannote":
+            self._vad_provider = PyAnnoteVAD(device=self.device, use_auth_token=self.use_auth_token)
+        elif method == "speechbrain":
+            self._vad_provider = SpeechBrainVAD(device=self.device, vad_params=params)
+        elif method == "nemo":
+            self._vad_provider = NemoVAD(device=self.device, vad_params=params)
+        elif method == "silero":
+            self._vad_provider = SileroVAD(vad_params=params)
         else:
-            # VAD only
-            segments = self.vad.detect_speech(
-                audio_path,
-                min_duration=vad_min_duration,
-                merge_threshold=vad_merge_threshold
-            )
-            return DiarizationResult(
-                segments=segments,
-                num_speakers=0  # Unknown without diarization
-            )
+            raise ValueError(f"Unknown VAD method: {self.vad_method}")
+        return self._vad_provider
 
     def _get_diarization_provider(self):
         if self._diarization_provider is not None:
@@ -360,6 +521,24 @@ class CombinedVADDiarization:
         else:
             raise ValueError(f"Unknown diarization method: {self.diarization_method}")
         return self._diarization_provider
+
+    @staticmethod
+    def _assign_speakers_to_segments(
+        vad_segments: List[SpeechSegment],
+        diar_segments: List[SpeechSegment],
+    ) -> List[SpeechSegment]:
+        if not vad_segments:
+            return vad_segments
+
+        for seg in vad_segments:
+            best_speaker, best_overlap = None, 0.0
+            for diar_seg in diar_segments:
+                overlap = max(0.0, min(seg.end, diar_seg.end) - max(seg.start, diar_seg.start))
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_speaker = diar_seg.speaker
+            seg.speaker = best_speaker
+        return vad_segments
 
 
 def _parse_rttm(rttm_path: Union[str, Path], uri: Optional[str] = None) -> List[SpeechSegment]:

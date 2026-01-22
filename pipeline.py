@@ -70,6 +70,8 @@ class TranscriptionConfig:
     
     use_vad: bool = True
     use_diarization: bool = False
+    vad_method: str = "pyannote"
+    vad_params: Optional[Dict[str, Any]] = None
     diarization_method: str = "pyannote"
     diarization_params: Optional[Dict[str, Any]] = None
     num_speakers: Optional[int] = None
@@ -120,6 +122,8 @@ class TranscriptionPipeline:
             self._vad_diarization = CombinedVADDiarization(
                 device=self.config.device,
                 use_auth_token=self.config.hf_token,
+                vad_method=self.config.vad_method,
+                vad_params=self.config.vad_params,
                 diarization_method=self.config.diarization_method,
                 diarization_params=self.config.diarization_params,
             )
@@ -164,7 +168,7 @@ class TranscriptionPipeline:
             if self.config.use_vad or self.config.use_diarization:
                 logger.info("Step 1: VAD/Diarization...")
                 diarization_result = self.vad_diarization.process(
-                    working_audio_path, use_diarization=self.config.use_diarization,
+                    working_audio_path, use_vad=self.config.use_vad, use_diarization=self.config.use_diarization,
                     num_speakers=self.config.num_speakers, min_speakers=self.config.min_speakers,
                     max_speakers=self.config.max_speakers, vad_min_duration=self.config.vad_min_duration,
                     vad_merge_threshold=self.config.vad_merge_threshold
@@ -295,6 +299,8 @@ def transcribe_file(
     language: Optional[str] = None,
     use_vad: bool = True,
     use_diarization: bool = False,
+    vad_method: str = "pyannote",
+    vad_params: Optional[Dict[str, Any]] = None,
     diarization_method: str = "pyannote",
     diarization_params: Optional[Dict[str, Any]] = None,
     num_speakers: Optional[int] = None,
@@ -306,6 +312,7 @@ def transcribe_file(
     config = TranscriptionConfig(
         whisper_model=whisper_model, language=language,
         use_vad=use_vad, use_diarization=use_diarization,
+        vad_method=vad_method, vad_params=vad_params,
         diarization_method=diarization_method, diarization_params=diarization_params,
         num_speakers=num_speakers,
         use_alignment=use_alignment, hf_token=hf_token
@@ -326,6 +333,8 @@ if __name__ == "__main__":
     parser.add_argument("-m", "--model", default="large-v3", help="Whisper model")
     parser.add_argument("-l", "--language", help="Language code")
     parser.add_argument("--no-vad", dest="vad", action="store_false")
+    parser.add_argument("--vad-method", default="pyannote")
+    parser.add_argument("--vad-params", help="JSON dict of VAD params")
     parser.add_argument("--diarization", action="store_true")
     parser.add_argument("--diarization-method", default="pyannote")
     parser.add_argument("--diarization-params", help="JSON dict of diarization params")
@@ -339,10 +348,14 @@ if __name__ == "__main__":
     diar_params = None
     if args.diarization_params:
         diar_params = json.loads(args.diarization_params)
+    vad_params = None
+    if args.vad_params:
+        vad_params = json.loads(args.vad_params)
 
     result = transcribe_file(
         args.audio_path, args.output, args.model, args.language,
-        args.vad, args.diarization, args.diarization_method, diar_params,
+        args.vad, args.diarization, args.vad_method, vad_params,
+        args.diarization_method, diar_params,
         args.num_speakers, not args.no_alignment,
         args.hf_token, args.device
     )
