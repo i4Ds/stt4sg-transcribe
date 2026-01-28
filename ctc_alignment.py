@@ -357,3 +357,109 @@ def save_alignment_log(result: AlignmentResult, output_path: Union[str, Path], a
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(log_data, f, indent=2, ensure_ascii=False)
     logger.info(f"Saved alignment log to {output_path}")
+
+
+def load_srt_segments(srt_path: Union[str, Path]) -> List[dict]:
+    """
+    Load segments from an SRT file for alignment.
+    
+    Args:
+        srt_path: Path to the SRT file
+        
+    Returns:
+        List of segment dicts with 'text', 'start', 'end'
+    """
+    import re
+    import pysubs2
+    
+    subs = pysubs2.load(str(srt_path))
+    segments = []
+    
+    for event in subs:
+        text = event.text.strip()
+        text = re.sub(r'^\[SPEAKER_\d+\]\s*', '', text)
+        text = re.sub(r'^\[[^\]]+\]\s*', '', text)
+        
+        if not text:
+            continue
+            
+        segments.append({
+            "text": text,
+            "start": event.start / 1000.0,
+            "end": event.end / 1000.0,
+        })
+    
+    return segments
+
+
+def align_srt_to_audio(
+    audio_path: Union[str, Path],
+    srt_path: Union[str, Path],
+    output_path: Optional[Union[str, Path]] = None,
+    language: str = "de",
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    model_name: Optional[str] = None,
+) -> AlignmentResult:
+    """
+    Align an existing SRT file to audio using CTC forced alignment.
+    
+    Args:
+        audio_path: Path to the audio file
+        srt_path: Path to the SRT file with transcription
+        output_path: Optional path to save the aligned SRT
+        language: Language code for alignment model
+        device: Device to use (cuda/cpu)
+        model_name: Optional custom alignment model
+        
+    Returns:
+        AlignmentResult with word-level timestamps
+    """
+
+    segments = load_srt_segments(srt_path)
+    logger.info(f"Loaded {len(segments)} segments from {srt_path}")
+    
+    aligner = CTCAligner(language=language, device=device, model_name=model_name)
+    result = aligner.align(segments, audio_path)
+    
+    if output_path:
+        from srt_formatter import segments_to_srt
+        aligned_segments = [seg.to_dict() for seg in result.segments]
+        segments_to_srt(aligned_segments, output_path, include_speaker=False)
+        logger.info(f"Saved aligned SRT to {output_path}")
+    
+    return result
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    parser = argparse.ArgumentParser(description="Align SRT to audio using CTC forced alignment")
+    parser.add_argument("audio_path", help="Path to audio file")
+    parser.add_argument("srt_path", help="Path to SRT file")
+    parser.add_argument("-o", "--output", help="Output aligned SRT path")
+    parser.add_argument("-l", "--language", default="de", help="Language code (default: de)")
+    parser.add_argument("--device", choices=["cuda", "cpu"], help="Device to use")
+    parser.add_argument("--model", help="Custom alignment model name")
+    parser.add_argument("--save-log", help="Path to save alignment log JSON")
+    
+    args = parser.parse_args()
+    
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    
+    result = align_srt_to_audio(
+        args.audio_path,
+        args.srt_path,
+        args.output,
+        args.language,
+        device,
+        args.model,
+    )
+    
+    if args.save_log:
+        save_alignment_log(result, args.save_log, args.audio_path)
+    
+    print(f"\nAligned {len(result.segments)} segments with {len(result.word_segments)} words")
+    if args.output:
+        print(f"Output: {args.output}")
