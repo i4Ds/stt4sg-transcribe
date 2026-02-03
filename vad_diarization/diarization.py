@@ -26,9 +26,10 @@ logger = logging.getLogger(__name__)
 # Diarization Implementations
 # =============================================================================
 
+
 class PyAnnoteDiarization(DiarizationProvider):
     """Speaker Diarization using PyAnnote."""
-    
+
     def __init__(
         self,
         device: str = "cpu",
@@ -37,33 +38,40 @@ class PyAnnoteDiarization(DiarizationProvider):
     ):
         """
         Initialize PyAnnote Diarization.
-        
+
         Args:
             device: Device to run the model on ('cuda' or 'cpu')
             params: Provider-specific parameters. Supports:
-                - pipeline_name: PyAnnote pipeline name (default: "pyannote/speaker-diarization-3.1")
-                - pipeline_params: Additional parameters passed to the pipeline
+                - pipeline_name: PyAnnote pipeline name (default: "pyannote/speaker-diarization-community-1")
+                - pipeline_params: Hyper-parameters passed to pipeline.instantiate
             use_auth_token: HuggingFace auth token for accessing gated models
         """
         super().__init__(device=device, params=params, use_auth_token=use_auth_token)
         self._pipeline = None
-        
+
     def _load_pipeline(self):
         """Lazy load the diarization pipeline."""
         if self._pipeline is None:
             from pyannote.audio import Pipeline
-            
-            pipeline_name = self.params.get("pipeline_name", "pyannote/speaker-diarization-3.1")
-            
+
+            pipeline_name = self.params.get(
+                "pipeline_name", "pyannote/speaker-diarization-community-1"
+            )
+
             logger.info("Loading PyAnnote diarization pipeline...")
             self._pipeline = Pipeline.from_pretrained(
-                pipeline_name,
-                token=self.use_auth_token
+                pipeline_name, token=self.use_auth_token
             )
             self._pipeline.to(torch.device(self.device))
+            pipeline_params = self.params.get("pipeline_params")
+            if pipeline_params:
+                logger.info(
+                    "Instantiating PyAnnote diarization pipeline with parameters"
+                )
+                self._pipeline.instantiate(pipeline_params)
             logger.info("PyAnnote diarization pipeline loaded successfully")
         return self._pipeline
-    
+
     def diarize(
         self,
         audio_path: Union[str, Path],
@@ -73,20 +81,20 @@ class PyAnnoteDiarization(DiarizationProvider):
     ) -> DiarizationResult:
         """
         Perform speaker diarization on audio.
-        
+
         Args:
             audio_path: Path to audio file
             num_speakers: Exact number of speakers (if known)
             min_speakers: Minimum number of speakers
             max_speakers: Maximum number of speakers
-            
+
         Returns:
             DiarizationResult with speaker-labeled segments
         """
         pipeline = self._load_pipeline()
-        
+
         logger.info(f"Running diarization on {audio_path}")
-        
+
         # Build kwargs for pipeline
         kwargs = {}
         if num_speakers is not None:
@@ -95,36 +103,28 @@ class PyAnnoteDiarization(DiarizationProvider):
             kwargs["min_speakers"] = min_speakers
         if max_speakers is not None:
             kwargs["max_speakers"] = max_speakers
-        
-        # Add pipeline_params from self.params
-        pipeline_params = self.params.get("pipeline_params")
-        if pipeline_params:
-            kwargs.update(pipeline_params)
-        
+
         diarization_output = pipeline(str(audio_path), **kwargs)
         diarization = diarization_output.speaker_diarization
-        
+
         # Convert to SpeechSegment objects with speaker labels
         segments = []
         speakers_set = set()
-        
+
         for turn, _, speaker in diarization.itertracks(yield_label=True):
-            segments.append(SpeechSegment(
-                start=turn.start,
-                end=turn.end,
-                speaker=speaker
-            ))
+            segments.append(
+                SpeechSegment(start=turn.start, end=turn.end, speaker=speaker)
+            )
             speakers_set.add(speaker)
-        
+
         # Sort by start time
         segments.sort(key=lambda x: x.start)
-        
-        logger.info(f"Diarization complete: {len(segments)} segments, {len(speakers_set)} speakers")
-        
-        return DiarizationResult(
-            segments=segments,
-            num_speakers=len(speakers_set)
+
+        logger.info(
+            f"Diarization complete: {len(segments)} segments, {len(speakers_set)} speakers"
         )
+
+        return DiarizationResult(segments=segments, num_speakers=len(speakers_set))
 
 
 class NemoClusteringDiarization(DiarizationProvider):
@@ -138,7 +138,7 @@ class NemoClusteringDiarization(DiarizationProvider):
     ):
         """
         Initialize NeMo Clustering Diarization.
-        
+
         Args:
             device: Device to run the model on ('cuda' or 'cpu')
             params: Provider-specific parameters (workdir, vad_model, speaker_model, etc.)
@@ -158,7 +158,9 @@ class NemoClusteringDiarization(DiarizationProvider):
             from omegaconf import OmegaConf
             from nemo.collections.asr.models import ClusteringDiarizer
         except Exception as exc:
-            raise RuntimeError("NeMo diarization requires nemo_toolkit[asr] and omegaconf") from exc
+            raise RuntimeError(
+                "NeMo diarization requires nemo_toolkit[asr] and omegaconf"
+            ) from exc
 
         audio_path = Path(audio_path)
         workdir = Path(self.params.get("workdir", audio_path.parent / "nemo_out"))
@@ -178,8 +180,16 @@ class NemoClusteringDiarization(DiarizationProvider):
         with open(manifest_path, "w", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
 
-        min_spk = min_speakers if min_speakers is not None else int(self.params.get("min_speakers", 1))
-        max_spk = max_speakers if max_speakers is not None else int(self.params.get("max_speakers", 10))
+        min_spk = (
+            min_speakers
+            if min_speakers is not None
+            else int(self.params.get("min_speakers", 1))
+        )
+        max_spk = (
+            max_speakers
+            if max_speakers is not None
+            else int(self.params.get("max_speakers", 10))
+        )
 
         cfg = OmegaConf.create(
             {
@@ -250,7 +260,9 @@ class NemoClusteringDiarization(DiarizationProvider):
         if not rttm_files:
             raise RuntimeError(f"No RTTM files found in {rttm_dir}")
         target_stem = audio_path.stem
-        rttm_path = next((p for p in rttm_files if p.stem == target_stem), rttm_files[0])
+        rttm_path = next(
+            (p for p in rttm_files if p.stem == target_stem), rttm_files[0]
+        )
         segments = parse_rttm(rttm_path, uri=target_stem)
         speakers_set = {s.speaker for s in segments if s.speaker}
         return DiarizationResult(segments=segments, num_speakers=len(speakers_set))
@@ -267,7 +279,7 @@ class SpeechBrainDiarization(DiarizationProvider):
     ):
         """
         Initialize SpeechBrain Diarization.
-        
+
         Args:
             device: Device to run the model on ('cuda' or 'cpu')
             params: Provider-specific parameters (vad_model, speaker_model, clustering_method, etc.)
@@ -288,7 +300,9 @@ class SpeechBrainDiarization(DiarizationProvider):
             from speechbrain.inference.speaker import EncoderClassifier
             from speechbrain.processing import diarization as diar
         except Exception as exc:
-            raise RuntimeError("SpeechBrain diarization requires speechbrain, torchaudio, numpy") from exc
+            raise RuntimeError(
+                "SpeechBrain diarization requires speechbrain, torchaudio, numpy"
+            ) from exc
 
         audio_path = Path(audio_path)
         run_device = get_device(self.device)
@@ -315,7 +329,9 @@ class SpeechBrainDiarization(DiarizationProvider):
             raise RuntimeError("No speech detected by SpeechBrain VAD")
 
         # Load speaker encoder
-        spk_model = self.params.get("speaker_model", "speechbrain/spkrec-ecapa-voxceleb")
+        spk_model = self.params.get(
+            "speaker_model", "speechbrain/spkrec-ecapa-voxceleb"
+        )
         spk = EncoderClassifier.from_hparams(
             source=spk_model,
             savedir=self.params.get("speaker_savedir", "pretrained_sb_ecapa"),
@@ -325,8 +341,16 @@ class SpeechBrainDiarization(DiarizationProvider):
         # Extract embeddings
         win = float(self.params.get("win", 1.5))
         hop = float(self.params.get("hop", 0.75))
-        min_spk = min_speakers if min_speakers is not None else int(self.params.get("min_spk", 2))
-        max_spk = max_speakers if max_speakers is not None else int(self.params.get("max_spk", 10))
+        min_spk = (
+            min_speakers
+            if min_speakers is not None
+            else int(self.params.get("min_spk", 2))
+        )
+        max_spk = (
+            max_speakers
+            if max_speakers is not None
+            else int(self.params.get("max_spk", 10))
+        )
         pval = float(self.params.get("pval", 0.30))
 
         embs, seg_meta = self._extract_embeddings(wav, sr, speech_segs, spk, win, hop)
@@ -339,9 +363,13 @@ class SpeechBrainDiarization(DiarizationProvider):
         clustering_method = self.params.get("clustering_method", "Spec_Clust_unorm")
         clustering_cls = getattr(diar, clustering_method, None)
         if clustering_cls is None:
-            raise RuntimeError(f"Unknown SpeechBrain clustering method: {clustering_method}")
+            raise RuntimeError(
+                f"Unknown SpeechBrain clustering method: {clustering_method}"
+            )
         clust = clustering_cls(min_num_spkrs=min_spk, max_num_spkrs=max_spk)
-        oracle_k = num_speakers if num_speakers is not None else min(max_spk, max(min_spk, 2))
+        oracle_k = (
+            num_speakers if num_speakers is not None else min(max_spk, max(min_spk, 2))
+        )
         clust.do_spec_clust(X, k_oracle=oracle_k, p_val=pval)
         labels = clust.labels_.astype(int)
 
@@ -356,6 +384,7 @@ class SpeechBrainDiarization(DiarizationProvider):
     def _load_mono_16k(path: Path):
         """Load audio as mono 16kHz."""
         import torchaudio
+
         wav, sr = torchaudio.load(str(path))
         if wav.shape[0] > 1:
             wav = wav.mean(dim=0, keepdim=True)
@@ -369,8 +398,8 @@ class SpeechBrainDiarization(DiarizationProvider):
         embs = []
         seg_meta = []
         wav_np = wav.squeeze(0).numpy()
-        
-        for (s, e) in speech_segs:
+
+        for s, e in speech_segs:
             s = float(s)
             e = float(e)
             t = s
@@ -381,11 +410,17 @@ class SpeechBrainDiarization(DiarizationProvider):
                 b = int(round(e2 * sr))
                 chunk = torch.from_numpy(wav_np[a:b].astype(np.float32))[None, :]
                 with torch.no_grad():
-                    emb = spk_encoder.encode_batch(chunk).squeeze(0).squeeze(0).cpu().numpy()
+                    emb = (
+                        spk_encoder.encode_batch(chunk)
+                        .squeeze(0)
+                        .squeeze(0)
+                        .cpu()
+                        .numpy()
+                    )
                 embs.append(emb)
                 seg_meta.append((s2, e2))
                 t += hop
-        
+
         return embs, seg_meta
 
 
@@ -393,15 +428,16 @@ class SpeechBrainDiarization(DiarizationProvider):
 # Diarization Factory
 # =============================================================================
 
+
 class DiarizationFactory:
     """Factory for creating Diarization provider instances."""
-    
+
     _providers: Dict[str, type] = {
         "pyannote": PyAnnoteDiarization,
         "nemo": NemoClusteringDiarization,
         "speechbrain": SpeechBrainDiarization,
     }
-    
+
     @classmethod
     def create(
         cls,
@@ -412,23 +448,25 @@ class DiarizationFactory:
     ) -> DiarizationProvider:
         """
         Create a Diarization provider instance.
-        
+
         Args:
             method: Diarization method name ('pyannote', 'nemo', 'speechbrain')
             device: Device to run on
             params: Provider-specific parameters
             use_auth_token: HuggingFace token
-            
+
         Returns:
             DiarizationProvider instance
         """
         method = method.lower()
         if method not in cls._providers:
-            raise ValueError(f"Unknown diarization method: {method}. Available: {list(cls._providers.keys())}")
-        
+            raise ValueError(
+                f"Unknown diarization method: {method}. Available: {list(cls._providers.keys())}"
+            )
+
         provider_cls = cls._providers[method]
         return provider_cls(device=device, params=params, use_auth_token=use_auth_token)
-    
+
     @classmethod
     def register(cls, name: str, provider_cls: type):
         """Register a custom Diarization provider."""

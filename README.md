@@ -101,7 +101,7 @@ Arguments:
 
 Diarization:
   --no-vad                      Disable VAD (on by default)
-  --vad-method VAD_METHOD       VAD method: pyannote | speechbrain | nemo | silero (default: pyannote)
+  --vad-method VAD_METHOD       VAD method: pyannote | speechbrain | nemo | silero (default: silero)
   --vad-params VAD_PARAMS       JSON dict of VAD parameters
   --diarization                 Enable speaker diarization (implies VAD)
   --diarization-method METHOD   Diarization method: pyannote | nemo | speechbrain (default: pyannote)
@@ -129,6 +129,26 @@ Auth:
   --hf-token HF_TOKEN           HuggingFace token (or set HF_TOKEN env)
 ```
 
+### VAD Parameter Examples
+
+Silero VAD supports `threshold` and `neg_threshold`:
+
+```
+--vad-method silero --vad-params '{"threshold": 0.5, "neg_threshold": 0.365}'
+```
+
+PyAnnote VAD supports `min_duration_on` and `min_duration_off` in this setup:
+
+```
+--vad-method pyannote --vad-params '{"min_duration_on": 0.0, "min_duration_off": 0.0}'
+```
+
+PyAnnote diarization supports `pipeline_params`, including segmentation settings:
+
+```
+--diarization-params '{"pipeline_params": {"segmentation": {"threshold": 0.44, "min_duration_off": 0.58}}}'
+```
+
 ## Output Files
 
 ### SRT Output
@@ -144,11 +164,12 @@ All logs are saved in `logs/timestamps/` with timestamps:
 
 ## Pipeline Steps
 
-1. **VAD/Diarization** (PyAnnote): Detect speech segments (diarization only if enabled)
-2. **Transcription** (Faster-Whisper): Transcribe using speech segment timestamps
+1. **VAD** (PyAnnote): Detect speech segments to guide transcription
+2. **Transcription** (Faster-Whisper): Transcribe using VAD segment timestamps
 3. **CTC Alignment** (wav2vec2): Generate word-level timestamps
-4. **Speaker Assignment**: Map speakers to transcript segments
-5. **SRT Generation**: Create subtitle file with speaker labels
+4. **Diarization** (PyAnnote): Identify different speakers
+5. **Speaker Assignment**: Map speakers to segments with purity calculation
+6. **SRT Generation**: Create subtitle file with speaker labels
 
 ## Programmatic Usage
 
