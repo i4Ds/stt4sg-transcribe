@@ -8,6 +8,7 @@ dependencies = [
     "faster-whisper>=1.2.1",
     "nemo-toolkit[asr]>=2.6.1",
     "nltk>=3.9.2",
+    "panns-inference",
     "transformers>=4.40.0",
     "numpy>=2.3.5",
     "omegaconf>=2.3.0",
