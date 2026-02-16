@@ -6,3 +6,4 @@ stt4sg_transcribe.egg-info/*
 diar_test/*
 pretrained_sb_vad/*
 pretrained_sb_ecapa/*
+PIPELINE.md

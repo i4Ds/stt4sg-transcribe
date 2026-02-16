@@ -13,6 +13,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import torch
 import torchaudio
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -259,7 +260,9 @@ def _tag_segment(
             "label": emo_label,
             "confidence": float(np.max(probs)) if probs.size else 0.0,
             "probs": _round_probs(tag_probs, round_digits),
-            "vad": _round_list(dims.tolist() if hasattr(dims, "tolist") else dims, round_digits),
+            "vad": _round_list(
+                dims.tolist() if hasattr(dims, "tolist") else dims, round_digits
+            ),
         }
     }
 
@@ -287,7 +290,10 @@ def _tag_segment(
                         "label": f_label,
                         "confidence": float(np.max(f_probs)) if f_probs.size else 0.0,
                         "probs": _round_probs(
-                            {label: float(prob) for label, prob in zip(EMO_LABELS, f_probs)},
+                            {
+                                label: float(prob)
+                                for label, prob in zip(EMO_LABELS, f_probs)
+                            },
                             round_digits,
                         ),
                         "vad": _round_list(
@@ -494,9 +500,7 @@ def main() -> int:
     try:
         from transformers import AutoModelForAudioClassification, AutoProcessor
     except Exception as exc:
-        logger.error(
-            "transformers is required. Install it (pip install transformers)."
-        )
+        logger.error("transformers is required. Install it (pip install transformers).")
         logger.error("Import error: %s", exc)
         return 1
 
@@ -519,20 +523,19 @@ def main() -> int:
         output_path = args.manifest.with_suffix(".emotion.jsonl")
 
     audio_cache: Dict[Path, Tuple[np.ndarray, int]] = {}
-
-    with open(args.manifest, "r", encoding="utf-8") as infile, open(
-        output_path, "w", encoding="utf-8"
-    ) as outfile:
-        for line_num, line in enumerate(infile, start=1):
+    total_lines = sum(1 for _ in args.manifest.open("r", encoding="utf-8"))
+    with (
+        open(args.manifest, "r", encoding="utf-8") as infile,
+        open(output_path, "w", encoding="utf-8") as outfile,
+    ):
+        for line_num, line in enumerate(tqdm(infile, total=total_lines), start=1):
             stripped = line.strip()
             if not stripped:
                 continue
             try:
                 entry = json.loads(stripped)
             except json.JSONDecodeError as exc:
-                logger.warning(
-                    "Skipping line %d: JSON decode error: %s", line_num, exc
-                )
+                logger.warning("Skipping line %d: JSON decode error: %s", line_num, exc)
                 continue
 
             entry.setdefault(

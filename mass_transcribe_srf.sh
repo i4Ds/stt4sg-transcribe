@@ -4,8 +4,9 @@
 #SBATCH --job-name srf_srt_batch
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
-#SBATCH --partition=top6
-#SBATCH --nodelist=calc-g-006
+#SBATCH --partition=performance
+#SBATCH --nodes=1
+#SBATCH --nodelist=calc-g-002,calc-g-004,calc-g-006
 #SBATCH --out=logs/srf_srt_batch%j.out
 #SBATCH --error=logs/srf_srt_batch%j.err
 

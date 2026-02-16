@@ -1,11 +1,12 @@
 #!/bin/bash
-#SBATCH --time=144:00:00
+#SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --job-name ser_emotion_recognition
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
-#SBATCH --partition=top6
-#SBATCH --nodelist=calc-g-006
+#SBATCH --partition=performance
+#SBATCH --nodes=1
+#SBATCH --nodelist=calc-g-002,calc-g-004,calc-g-006
 #SBATCH --out=logs/ser_emotion_recognition%j.out
 #SBATCH --error=logs/ser_emotion_recognition%j.err
 
@@ -34,35 +35,21 @@ fi
 
 python -V
 
-SER_CACHE_DIR="${SER_CACHE_DIR:-$HOME/.cache/huggingface}"
-LOCAL_ONLY_FLAG=""
-if [ "${SER_LOCAL_FILES_ONLY:-0}" = "1" ]; then
-    LOCAL_ONLY_FLAG="--local-files-only"
-fi
-
 ROOT_DIR="/mnt/nas05/data02/vincenzo/podcast_data/youtube/processed"
 
-for d in "${ROOT_DIR}"/*; do
-    [ -d "${d}" ] || continue
-    manifest="${d}/manifest.jsonl"
-    [ -f "${manifest}" ] || continue
+manifest="${ROOT_DIR}/manifest.jsonl"
+[ -f "${manifest}" ] || { echo "Manifest not found: ${manifest}"; exit 1; }
 
-    output="${d}/manifest.emotion.jsonl"
-    if [ -f "${output}" ]; then
-        echo "Skipping (exists): ${output}"
-        continue
-    fi
+dir="$(dirname "${manifest}")"
+output="${dir}/manifest.emotion.jsonl"
 
-    echo "SER: ${manifest}"
-    python ser.py "${manifest}" \
-        --output "${output}" \
-        --cache-dir "${SER_CACHE_DIR}" \
-        ${LOCAL_ONLY_FLAG} \
-        --batch-size 8 \
-        --chunk-seconds 10 \
-        --min-seconds 0.2 \
-        --slim-output \
-        --framewise \
-        --frame-seconds 2.0 \
-        --frame-hop 1.0
-done
+echo "SER: ${manifest}"
+python ser.py "${manifest}" \
+    --output "${output}" \
+    --batch-size 8 \
+    --chunk-seconds 10 \
+    --min-seconds 0.2 \
+    --slim-output \
+    --framewise \
+    --frame-seconds 2.0 \
+    --frame-hop 1.0

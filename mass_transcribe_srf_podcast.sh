@@ -4,8 +4,9 @@
 #SBATCH --job-name srf_podcast_diarize
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
-#SBATCH --partition=top6
-#SBATCH --nodelist=calc-g-006
+#SBATCH --partition=performance
+#SBATCH --nodes=1
+#SBATCH --nodelist=calc-g-002,calc-g-004,calc-g-006
 #SBATCH --out=logs/srf_podcast_diarize%j.out
 #SBATCH --error=logs/srf_podcast_diarize%j.err
 
@@ -15,15 +16,6 @@ python batch_transcribe.py /mnt/nas05/data02/vincenzo/podcast_data/srf/ \
     --vad-params '{"threshold": 0.5, "neg_threshold": 0.365}' \
     --no-logs \
     --skip-if-exist \
-    --tqdm
+    --tqdm \
+    --add_lock
 
-
-python extract_segments.py /mnt/nas05/data02/vincenzo/podcast_data/srf \
-    --output-dir /mnt/nas05/data02/vincenzo/podcast_data/srf/processed \
-    --min-purity 0.95 \
-    --min-coverage 0.9 \
-    --min-duration 3.0 \
-    --max-duration 30.0 \
-    --min-avg-logprob -0.5 \
-    --no-summary \
-    --max-pause 3

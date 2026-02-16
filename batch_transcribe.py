@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
@@ -176,6 +177,11 @@ def main() -> None:
         action="store_true",
         help="Show progress bar with ETA (requires tqdm)",
     )
+    parser.add_argument(
+        "--add_lock",
+        action="store_true",
+        help="Create lock file to prevent concurrent processing",
+    )
 
     # Model
     parser.add_argument("-m", "--model", default="large-v3", help="Whisper model")
@@ -299,6 +305,13 @@ def main() -> None:
 
     # Find files
     files = sorted(iter_audio_files(input_dir, extensions))
+
+    # Random shuffle for better load distribution if processing in parallel
+    # across multiple machines or processes. Comment out if you want deterministic order.
+    import random
+
+    random.shuffle(files)
+
     if args.limit:
         files = files[: args.limit]
 
@@ -335,12 +348,30 @@ def main() -> None:
 
             logger.info(f"Processing: {audio_path}")
             try:
-                result = pipeline.transcribe(
-                    audio_path,
-                    output_path=srt_output_path,
-                    save_logs=not args.no_logs,
-                )
-                logger.info(f"Wrote: {result['srt_path']}")
+                lock_path = None
+                if args.add_lock:
+                    lock_path = audio_path.with_suffix(".lock")
+                    try:
+                        # Atomic create; fail if already exists
+                        with open(lock_path, "x", encoding="utf-8") as f:
+                            f.write(f"pid:{os.getpid()}\nstarted:{time.time()}\n")
+                    except FileExistsError:
+                        logger.info(f"Skipping locked file: {audio_path}")
+                        continue
+
+                try:
+                    result = pipeline.transcribe(
+                        audio_path,
+                        output_path=srt_output_path,
+                        save_logs=not args.no_logs,
+                    )
+                    logger.info(f"Wrote: {result['srt_path']}")
+                finally:
+                    if args.add_lock and lock_path is not None and lock_path.exists():
+                        try:
+                            lock_path.unlink()
+                        except Exception:
+                            logger.exception(f"Failed to remove lock: {lock_path}")
             except Exception as exc:
                 logger.exception(f"Failed: {audio_path}")
                 errors.append(f"{audio_path}: {exc}")
