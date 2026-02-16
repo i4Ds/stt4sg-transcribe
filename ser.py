@@ -521,6 +521,14 @@ def main() -> int:
     output_path = args.output
     if output_path is None:
         output_path = args.manifest.with_suffix(".emotion.jsonl")
+    if output_path.exists():
+        current_lines = sum(1 for _ in output_path.open("r", encoding="utf-8"))
+        logger.info(
+            "Output file already exists: %s (%d lines)", output_path, current_lines
+        )
+    else:
+        current_lines = 0
+        logger.info("Output file will be created: %s", output_path)
 
     audio_cache: Dict[Path, Tuple[np.ndarray, int]] = {}
     total_lines = sum(1 for _ in args.manifest.open("r", encoding="utf-8"))
@@ -529,6 +537,8 @@ def main() -> int:
         open(output_path, "w", encoding="utf-8") as outfile,
     ):
         for line_num, line in enumerate(tqdm(infile, total=total_lines), start=1):
+            if line_num <= current_lines:
+                continue
             stripped = line.strip()
             if not stripped:
                 continue

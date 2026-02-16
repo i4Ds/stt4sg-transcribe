@@ -41,6 +41,10 @@ class FilterConfig:
     # Merging settings
     merge_same_speaker: bool = True
     max_pause_for_merge: float = 0.2  # seconds
+    # Maximum allowable total time (seconds) of non-main speakers overlapping
+    # a segment. If the sum of all other speakers' overlap time exceeds this
+    # threshold the segment is rejected.
+    max_non_main_time: float = 0.5
 
 
 @dataclass
@@ -69,6 +73,8 @@ class SegmentInfo:
 
     # Speaker overlap details
     speaker_overlaps: Optional[Dict[str, float]] = None
+    # Total time (s) of non-main speakers overlapping this segment
+    non_main_time: Optional[float] = None
 
     # Word-level info (optional)
     words: Optional[List[Dict]] = None
@@ -94,6 +100,7 @@ class SegmentInfo:
             "no_speech_prob": self.no_speech_prob,
             "compression_ratio": self.compression_ratio,
             "speaker_overlaps": self.speaker_overlaps,
+            "non_main_time": self.non_main_time,
             "avg_word_score": self.avg_word_score,
             "is_merged": self.is_merged,
             "merge_count": self.merge_count,
@@ -165,6 +172,23 @@ def passes_quality_filter(seg: Dict, config: FilterConfig) -> tuple[bool, str]:
     # Must have text
     if not seg.get("text", "").strip():
         return False, "empty text"
+
+    # Check total overlap time from non-main speakers (if available)
+    overlaps = seg.get("speaker_overlaps") or {}
+    if overlaps and config.max_non_main_time is not None:
+        main = seg.get("speaker")
+        try:
+            non_main_time = sum(
+                float(t) for s, t in overlaps.items() if s != main and t is not None
+            )
+        except Exception:
+            non_main_time = 0.0
+
+        if non_main_time > config.max_non_main_time:
+            return (
+                False,
+                f"non_main_time {non_main_time:.2f}s > {config.max_non_main_time}s",
+            )
 
     return True, ""
 
@@ -362,7 +386,7 @@ def cut_audio_segment(
     end: float,
     output_path: Path,
     format: str = "flac",
-    frame_ms: int = 400,
+    frame_ms: int = 10,
 ) -> bool:
     """
     Cut a segment from audio and save to file.
@@ -409,7 +433,7 @@ def process_json_file(
     input_root: Path,
     audio_format: str = "flac",
     dry_run: bool = False,
-    frame_ms: int = 400,
+    frame_ms: int = 10,
 ) -> tuple[List[Dict], List[Dict], Dict]:
     """
     Process a single JSON file and extract segments.
@@ -462,6 +486,15 @@ def process_json_file(
         if passed:
             quality_passed.append(seg)
         else:
+            # compute non_main_time for logging/storage
+            overlaps = seg.get("speaker_overlaps") or {}
+            main = seg.get("speaker")
+            try:
+                non_main_time = sum(
+                    float(t) for s, t in overlaps.items() if s != main and t is not None
+                )
+            except Exception:
+                non_main_time = None
             rejected.append(
                 {
                     "stage": "quality_filter",
@@ -477,6 +510,7 @@ def process_json_file(
                         "purity": seg.get("purity"),
                         "coverage": seg.get("coverage"),
                         "avg_logprob": seg.get("avg_logprob"),
+                        "non_main_time": non_main_time,
                     },
                 }
             )
@@ -596,6 +630,11 @@ def process_json_file(
             no_speech_prob=seg.get("no_speech_prob"),
             compression_ratio=seg.get("compression_ratio"),
             speaker_overlaps=seg.get("speaker_overlaps"),
+            non_main_time=(
+                sum(float(t) for s, t in (seg.get("speaker_overlaps") or {}).items() if s != seg.get("speaker") and t is not None)
+                if seg.get("speaker_overlaps")
+                else None
+            ),
             words=seg.get("words"),
             avg_word_score=calculate_avg_word_score(seg),
             is_merged=seg.get("_is_merged", False),
@@ -682,6 +721,13 @@ def main():
         help="Maximum pause between segments to merge (seconds)",
     )
 
+    parser.add_argument(
+        "--max-non-main-time",
+        type=float,
+        default=0.5,
+        help="Maximum total time (s) of non-main speakers overlapping a segment",
+    )
+
     # Other options
     parser.add_argument(
         "--dry-run",
@@ -731,11 +777,13 @@ def main():
         max_avg_logprob=args.max_avg_logprob,
         merge_same_speaker=args.merge,
         max_pause_for_merge=args.max_pause,
+        max_non_main_time=args.max_non_main_time,
     )
 
     logger.info(
         f"Filter config: min_dur={config.min_duration}s, max_dur={config.max_duration}s, "
-        f"min_purity={config.min_purity}, min_coverage={config.min_coverage}"
+        f"min_purity={config.min_purity}, min_coverage={config.min_coverage}, "
+        f"max_non_main_time={config.max_non_main_time}s"
     )
     logger.info(
         f"Merge config: enabled={config.merge_same_speaker}, max_pause={config.max_pause_for_merge}s, "
@@ -851,6 +899,7 @@ def main():
                     "min_avg_logprob": config.min_avg_logprob,
                     "max_avg_logprob": config.max_avg_logprob,
                     "merge_same_speaker": config.merge_same_speaker,
+                    "max_non_main_time": config.max_non_main_time,
                     "max_pause_for_merge": config.max_pause_for_merge,
                     "max_merged_duration": config.max_duration,
                 },
