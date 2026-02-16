@@ -35,12 +35,6 @@ fi
 
 python -V
 
-SER_CACHE_DIR="${SER_CACHE_DIR:-$HOME/.cache/huggingface}"
-LOCAL_ONLY_FLAG=""
-if [ "${SER_LOCAL_FILES_ONLY:-0}" = "1" ]; then
-    LOCAL_ONLY_FLAG="--local-files-only"
-fi
-
 ROOT_DIR="/mnt/nas05/data02/vincenzo/podcast_data/srf/processed"
 
 manifest="${ROOT_DIR}/manifest.jsonl"
@@ -48,16 +42,10 @@ manifest="${ROOT_DIR}/manifest.jsonl"
 
 dir="$(dirname "${manifest}")"
 output="${dir}/manifest.emotion.jsonl"
-if [ -f "${output}" ]; then
-    echo "Skipping (exists): ${output}"
-    exit 0
-fi
 
 echo "SER: ${manifest}"
 python ser.py "${manifest}" \
     --output "${output}" \
-    --cache-dir "${SER_CACHE_DIR}" \
-    ${LOCAL_ONLY_FLAG} \
     --batch-size 8 \
     --chunk-seconds 10 \
     --min-seconds 0.2 \

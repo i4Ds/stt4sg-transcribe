@@ -631,7 +631,11 @@ def process_json_file(
             compression_ratio=seg.get("compression_ratio"),
             speaker_overlaps=seg.get("speaker_overlaps"),
             non_main_time=(
-                sum(float(t) for s, t in (seg.get("speaker_overlaps") or {}).items() if s != seg.get("speaker") and t is not None)
+                sum(
+                    float(t)
+                    for s, t in (seg.get("speaker_overlaps") or {}).items()
+                    if s != seg.get("speaker") and t is not None
+                )
                 if seg.get("speaker_overlaps")
                 else None
             ),
