@@ -173,6 +173,7 @@ def _predict_framewise(
     sr: int,
     frame_seconds: float,
     hop_seconds: float,
+    context_seconds: float,
     batch_size: int,
     min_seconds: float,
     device: str,
@@ -180,21 +181,38 @@ def _predict_framewise(
     if audio.size == 0:
         return []
 
-    frame_samples = int(frame_seconds * sr)
-    hop_samples = int(hop_seconds * sr)
+    frame_samples = max(int(round(frame_seconds * sr)), 1)
+    hop_samples = max(int(round(hop_seconds * sr)), 1)
+    context_samples = max(int(round(context_seconds * sr)), frame_samples)
     min_samples = int(min_seconds * sr)
-    if frame_samples <= 0 or hop_samples <= 0:
-        return []
+    if audio.shape[0] <= frame_samples:
+        starts = [0]
+    else:
+        starts = list(range(0, audio.shape[0] - frame_samples + 1, hop_samples))
+        final_start = audio.shape[0] - frame_samples
+        if starts[-1] != final_start:
+            starts.append(final_start)
 
     windows: List[np.ndarray] = []
     times: List[Tuple[float, float]] = []
-    for start in range(0, audio.shape[0], hop_samples):
-        end = start + frame_samples
-        chunk = audio[start:end]
-        if chunk.shape[0] < min_samples:
+    for start in starts:
+        end = min(start + frame_samples, audio.shape[0])
+        if (end - start) < min_samples:
             continue
-        windows.append(chunk)
-        times.append((start / sr, min(end, audio.shape[0]) / sr))
+
+        center = start + ((end - start) // 2)
+        context_start = center - (context_samples // 2)
+        context_end = context_start + context_samples
+        ctx = np.zeros((context_samples,), dtype=np.float32)
+        src_start = max(0, context_start)
+        src_end = min(audio.shape[0], context_end)
+        if src_end > src_start:
+            dst_start = src_start - context_start
+            dst_end = dst_start + (src_end - src_start)
+            ctx[dst_start:dst_end] = audio[src_start:src_end]
+
+        windows.append(ctx)
+        times.append((start / sr, end / sr))
 
     if not windows:
         return []
@@ -239,6 +257,7 @@ def _tag_segment(
     framewise: bool,
     frame_seconds: float,
     hop_seconds: float,
+    context_seconds: float,
     segment_start: Optional[float],
     device: str,
 ) -> Dict[str, object]:
@@ -274,6 +293,7 @@ def _tag_segment(
             sr,
             frame_seconds=frame_seconds,
             hop_seconds=hop_seconds,
+            context_seconds=context_seconds,
             batch_size=batch_size,
             min_seconds=min_seconds,
             device=device,
@@ -321,6 +341,7 @@ def _tag_entry(
     framewise: bool,
     frame_seconds: float,
     hop_seconds: float,
+    context_seconds: float,
     cache_audio: bool,
     audio_cache: Dict[Path, Tuple[np.ndarray, int]],
     device: str,
@@ -367,6 +388,7 @@ def _tag_entry(
             framewise=framewise,
             frame_seconds=frame_seconds,
             hop_seconds=hop_seconds,
+            context_seconds=context_seconds,
             segment_start=segment_start_for_frames,
             device=device,
         )
@@ -463,14 +485,23 @@ def main() -> int:
     parser.add_argument(
         "--frame-seconds",
         type=float,
-        default=2.0,
-        help="Frame length in seconds for framewise mode (default: 2.0)",
+        default=1.0,
+        help="Frame length in seconds for framewise mode (default: 1.0)",
     )
     parser.add_argument(
         "--frame-hop",
         type=float,
-        default=1.0,
-        help="Frame hop in seconds for framewise mode (default: 1.0)",
+        default=0.5,
+        help="Frame hop in seconds for framewise mode (default: 0.5)",
+    )
+    parser.add_argument(
+        "--context-seconds",
+        type=float,
+        default=4.0,
+        help=(
+            "Context window in seconds for framewise mode; each frame is inferred "
+            "from centered context (default: 4.0)"
+        ),
     )
     parser.add_argument(
         "--no-cache",
@@ -534,7 +565,7 @@ def main() -> int:
     total_lines = sum(1 for _ in args.manifest.open("r", encoding="utf-8"))
     with (
         open(args.manifest, "r", encoding="utf-8") as infile,
-        open(output_path, "w", encoding="utf-8") as outfile,
+        open(output_path, "a", encoding="utf-8") as outfile,
     ):
         for line_num, line in enumerate(tqdm(infile, total=total_lines), start=1):
             if line_num <= current_lines:
@@ -557,6 +588,9 @@ def main() -> int:
                     "framewise": args.framewise,
                     "frame_seconds": args.frame_seconds if args.framewise else None,
                     "frame_hop": args.frame_hop if args.framewise else None,
+                    "context_seconds": (
+                        args.context_seconds if args.framewise else None
+                    ),
                     "labels": EMO_LABELS,
                 },
             )
@@ -574,6 +608,7 @@ def main() -> int:
                 framewise=args.framewise,
                 frame_seconds=args.frame_seconds,
                 hop_seconds=args.frame_hop,
+                context_seconds=args.context_seconds,
                 cache_audio=not args.no_cache,
                 audio_cache=audio_cache,
                 device=device,
