@@ -1,229 +1,90 @@
 """
-Audio pattern recognition for AudioSet tags using PANNs inference.
+Framewise AudioSet tagging using AST (Hugging Face).
 
-Reads a JSONL manifest and appends tag probabilities for target labels.
+This script reads a JSONL manifest and appends frame-level tags only.
+No event extraction and no threshold-based laughter logic.
 """
 
 import argparse
 import json
 import logging
-import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torchaudio
+from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_MODEL_ID = "MIT/ast-finetuned-audioset-10-10-0.4593"
 
-TARGET_LABELS = [
+# Ontology-aligned target labels.
+SPEECH_LABELS = [
     "Speech",
-    "Music",
+    "Male speech, man speaking",
+    "Female speech, woman speaking",
+    "Child speech, kid speaking",
+    "Conversation",
+    "Narration, monologue",
+    "Babbling",
+    "Speech synthesizer",
+]
+
+HUMAN_VOICE_LABELS = [
+    "Shout",
+    "Screaming",
+    "Whispering",
     "Laughter",
-    "Cough",
-    "Sneeze",
+    "Baby laughter",
+    "Giggle",
+    "Snicker",
+    "Belly laugh",
+    "Chuckle, chortle",
+    "Crying, sobbing",
+    "Wail, moan",
+    "Sigh",
+    "Singing",
+    "Humming",
+    "Groan",
+    "Grunt",
+]
+
+RESPIRATORY_LABELS = [
     "Breathing",
+    "Wheeze",
+    "Snoring",
+    "Gasp",
+    "Pant",
+    "Snort",
+    "Cough",
+    "Throat clearing",
+    "Sneeze",
+    "Sniff",
 ]
 
 
-def _normalize_label(label: str) -> str:
-    return "".join(ch.lower() if ch.isalnum() else " " for ch in label).strip()
-
-
-def _resolve_label_indices(
-    available_labels: List[str], target_labels: List[str]
-) -> Tuple[List[int], List[str]]:
-    norm_map = {_normalize_label(lbl): lbl for lbl in available_labels}
-    resolved_indices: List[int] = []
-    resolved_labels: List[str] = []
-
-    for target in target_labels:
-        norm_target = _normalize_label(target)
-        if norm_target in norm_map:
-            label = norm_map[norm_target]
-            resolved_indices.append(available_labels.index(label))
-            resolved_labels.append(label)
+def _dedupe_keep_order(labels: Sequence[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for label in labels:
+        if label in seen:
             continue
-
-        # Fallback: substring match
-        matches = [
-            lbl
-            for lbl in available_labels
-            if norm_target in _normalize_label(lbl)
-            or _normalize_label(lbl) in norm_target
-        ]
-        if len(matches) == 1:
-            label = matches[0]
-            resolved_indices.append(available_labels.index(label))
-            resolved_labels.append(label)
-            continue
-
-        logger.warning(
-            "Target label '%s' not found in available labels. Skipping.",
-            target,
-        )
-
-    return resolved_indices, resolved_labels
+        seen.add(label)
+        out.append(label)
+    return out
 
 
-def _load_audio(
-    audio_path: Path,
-    target_sr: int,
-    cache: Dict[Path, Tuple[np.ndarray, int]],
-) -> Tuple[np.ndarray, int]:
-    if audio_path in cache:
-        return cache[audio_path]
-
-    waveform, sr = torchaudio.load(str(audio_path))
-    if waveform.ndim == 2 and waveform.shape[0] > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
-    waveform = waveform.squeeze(0)
-
-    if sr != target_sr:
-        resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=target_sr)
-        waveform = resampler(waveform)
-        sr = target_sr
-
-    audio = waveform.detach().cpu().numpy().astype(np.float32, copy=False)
-    cache[audio_path] = (audio, sr)
-    return audio, sr
+TARGET_LABELS = _dedupe_keep_order(
+    SPEECH_LABELS + HUMAN_VOICE_LABELS + RESPIRATORY_LABELS
+)
 
 
-def _batch_infer(model, audio_list: List[np.ndarray]) -> np.ndarray:
-    if not audio_list:
-        return np.zeros((0, 0), dtype=np.float32)
-
-    max_len = max(arr.shape[0] for arr in audio_list)
-    batch = np.zeros((len(audio_list), max_len), dtype=np.float32)
-    for idx, arr in enumerate(audio_list):
-        batch[idx, : arr.shape[0]] = arr
-
-    with torch.no_grad():
-        clipwise_output, _ = model.inference(batch)
-    return clipwise_output
-
-
-def _predict_clipwise(
-    model,
-    audio: np.ndarray,
-    sr: int,
-    chunk_seconds: float,
-    batch_size: int,
-    min_seconds: float,
-) -> np.ndarray:
-    if audio.size == 0:
-        return np.zeros((model.num_classes,), dtype=np.float32)
-
-    chunk_samples = int(chunk_seconds * sr)
-    min_samples = int(min_seconds * sr)
-    if chunk_samples <= 0 or audio.shape[0] <= chunk_samples:
-        outputs = _batch_infer(model, [audio])
-        return outputs[0]
-
-    chunks: List[np.ndarray] = []
-    weights: List[float] = []
-    for start in range(0, audio.shape[0], chunk_samples):
-        chunk = audio[start : start + chunk_samples]
-        if chunk.shape[0] < min_samples:
-            continue
-        chunks.append(chunk)
-        weights.append(float(chunk.shape[0]))
-
-    if not chunks:
-        outputs = _batch_infer(model, [audio])
-        return outputs[0]
-
-    outputs_list: List[np.ndarray] = []
-    for idx in range(0, len(chunks), batch_size):
-        batch = chunks[idx : idx + batch_size]
-        outputs_list.append(_batch_infer(model, batch))
-
-    outputs = np.concatenate(outputs_list, axis=0)
-    weights_arr = np.array(weights, dtype=np.float32)
-    weighted = (outputs * weights_arr[:, None]).sum(axis=0) / max(
-        weights_arr.sum(), 1.0
-    )
-    return weighted
-
-
-def _aggregate_frames(
-    frames: List[Tuple[float, float, np.ndarray]],
-    frame_seconds: float,
-    hop_seconds: float,
-) -> List[Tuple[float, float, np.ndarray]]:
-    if not frames:
-        return []
-    if frame_seconds <= 0 or hop_seconds <= 0:
-        return frames
-
-    raw_hop = frames[0][1] - frames[0][0]
-    if raw_hop <= 0:
-        return frames
-
-    window = max(int(round(frame_seconds / raw_hop)), 1)
-    hop = max(int(round(hop_seconds / raw_hop)), 1)
-
-    probs = np.stack([f[2] for f in frames], axis=0)
-    results = []
-    for start_idx in range(0, len(frames) - window + 1, hop):
-        end_idx = start_idx + window
-        start_t = frames[start_idx][0]
-        end_t = frames[end_idx - 1][1]
-        avg = probs[start_idx:end_idx].mean(axis=0)
-        results.append((start_t, end_t, avg))
-    return results
-
-
-def _predict_framewise(
-    sed_model,
-    audio: np.ndarray,
-    sr: int,
-    chunk_seconds: float,
-    frame_seconds: float,
-    hop_seconds: float,
-    min_seconds: float,
-) -> Tuple[
-    List[Tuple[float, float, np.ndarray]], List[Tuple[float, float, np.ndarray]]
-]:
-    if audio.size == 0:
-        return [], []
-
-    min_samples = int(min_seconds * sr)
-    if audio.shape[0] < min_samples:
-        return [], []
-
-    chunk_samples = int(chunk_seconds * sr)
-    if chunk_samples <= 0:
-        chunk_samples = audio.shape[0]
-
-    raw_results: List[Tuple[float, float, np.ndarray]] = []
-    for start in range(0, audio.shape[0], chunk_samples):
-        chunk = audio[start : start + chunk_samples]
-        if chunk.shape[0] < min_samples:
-            continue
-        chunk_batch = chunk[None, :]
-        with torch.no_grad():
-            framewise_output = sed_model.inference(chunk_batch)
-
-        framewise = framewise_output[0]
-        frames = framewise.shape[0]
-        if frames == 0:
-            continue
-
-        chunk_duration = chunk.shape[0] / max(sr, 1)
-        frame_hop = chunk_duration / frames
-        raw_frames: List[Tuple[float, float, np.ndarray]] = []
-        for idx in range(frames):
-            t0 = (start / sr) + idx * frame_hop
-            t1 = (start / sr) + (idx + 1) * frame_hop
-            raw_frames.append((t0, t1, framewise[idx]))
-
-        raw_results.extend(raw_frames)
-
-    agg_results = _aggregate_frames(raw_results, frame_seconds, hop_seconds)
-    return raw_results, agg_results
+def _round_probs(probs: Dict[str, float], digits: Optional[int]) -> Dict[str, float]:
+    if digits is None:
+        return probs
+    return {k: round(v, digits) for k, v in probs.items()}
 
 
 def _find_audio_path(entry: Dict, segment: Optional[Dict]) -> Optional[Path]:
@@ -251,93 +112,223 @@ def _find_audio_path(entry: Dict, segment: Optional[Dict]) -> Optional[Path]:
     return None
 
 
-def _segment_bounds(segment: Dict) -> Tuple[Optional[float], Optional[float]]:
-    if "start" in segment and "end" in segment:
-        return segment.get("start"), segment.get("end")
-    if "offset" in segment and "duration" in segment:
-        offset = segment.get("offset")
-        duration = segment.get("duration")
-        if offset is not None and duration is not None:
-            return float(offset), float(offset) + float(duration)
-    return None, None
+def _load_audio(
+    audio_path: Path,
+    target_sr: int,
+    cache: Dict[Path, Tuple[np.ndarray, int]],
+) -> Tuple[np.ndarray, int]:
+    if audio_path in cache:
+        return cache[audio_path]
+
+    waveform, sr = torchaudio.load(str(audio_path))
+    if waveform.abs().max() > 1.0:
+        waveform = waveform.float() / 32768.0
+
+    if waveform.ndim == 2 and waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    waveform = waveform.squeeze(0)
+
+    if sr != target_sr:
+        waveform = torchaudio.transforms.Resample(orig_freq=sr, new_freq=target_sr)(
+            waveform
+        )
+        sr = target_sr
+
+    audio = waveform.detach().cpu().numpy().astype(np.float32, copy=False)
+    cache[audio_path] = (audio, sr)
+    return audio, sr
 
 
-def _round_probs(probs: Dict[str, float], digits: Optional[int]) -> Dict[str, float]:
-    if digits is None:
-        return probs
-    return {k: round(v, digits) for k, v in probs.items()}
+def _resolve_label_indices(
+    id2label: Dict[int, str],
+    target_labels: Sequence[str],
+) -> Tuple[List[int], List[str]]:
+    label_to_idx = {label: idx for idx, label in id2label.items()}
+    indices: List[int] = []
+    names: List[str] = []
+    for label in target_labels:
+        idx = label_to_idx.get(label)
+        if idx is None:
+            logger.warning("Label '%s' not found in model labels; skipping.", label)
+            continue
+        indices.append(idx)
+        names.append(label)
+    return indices, names
 
 
-def _tag_segment(
+def _extract_centered_context(
+    audio: np.ndarray, center_sample: int, context_samples: int
+) -> np.ndarray:
+    out = np.zeros((context_samples,), dtype=np.float32)
+    start = center_sample - (context_samples // 2)
+    end = start + context_samples
+
+    src_start = max(0, start)
+    src_end = min(audio.shape[0], end)
+    if src_end <= src_start:
+        return out
+
+    dst_start = src_start - start
+    dst_end = dst_start + (src_end - src_start)
+    out[dst_start:dst_end] = audio[src_start:src_end]
+    return out
+
+
+def _build_frame_starts(
+    total_samples: int, frame_samples: int, hop_samples: int
+) -> List[int]:
+    if total_samples <= 0 or total_samples <= frame_samples:
+        return [0]
+
+    starts = list(range(0, total_samples - frame_samples + 1, hop_samples))
+    final_start = total_samples - frame_samples
+    if starts[-1] != final_start:
+        starts.append(final_start)
+    return starts
+
+
+def _predict_framewise(
     model,
-    sed_model,
+    feature_extractor,
     audio: np.ndarray,
     sr: int,
-    label_indices: List[int],
-    label_names: List[str],
-    chunk_seconds: float,
-    batch_size: int,
-    min_seconds: float,
-    round_digits: Optional[int],
-    framewise: bool,
     frame_seconds: float,
-    hop_seconds: float,
-    segment_start: Optional[float],
-    save_raw_frames: bool,
-) -> Dict[str, object]:
-    clipwise = _predict_clipwise(
-        model,
-        audio,
-        sr,
-        chunk_seconds=chunk_seconds,
-        batch_size=batch_size,
-        min_seconds=min_seconds,
-    )
-    tag_probs = {
-        label: float(clipwise[idx]) for label, idx in zip(label_names, label_indices)
-    }
-    result = {"audio_tags": _round_probs(tag_probs, round_digits)}
+    frame_hop: float,
+    context_seconds: float,
+    batch_size: int,
+    device: str,
+) -> List[Tuple[float, float, np.ndarray]]:
+    if audio.size == 0:
+        return []
 
-    if framewise and sed_model is not None:
-        raw_frames, frames = _predict_framewise(
-            sed_model,
-            audio,
-            sr,
-            chunk_seconds=chunk_seconds,
-            frame_seconds=frame_seconds,
-            hop_seconds=hop_seconds,
-            min_seconds=min_seconds,
-        )
-        frame_list = []
-        for start, end, probs in frames:
-            frame_tags = {
-                label: float(probs[idx])
-                for label, idx in zip(label_names, label_indices)
-            }
-            frame_list.append(
-                {
-                    "start": (segment_start or 0.0) + start,
-                    "end": (segment_start or 0.0) + end,
-                    "audio_tags": _round_probs(frame_tags, round_digits),
-                }
+    frame_samples = max(int(round(frame_seconds * sr)), 1)
+    hop_samples = max(int(round(frame_hop * sr)), 1)
+    context_samples = max(int(round(context_seconds * sr)), frame_samples)
+
+    starts = _build_frame_starts(audio.shape[0], frame_samples, hop_samples)
+
+    frames: List[Tuple[float, float, np.ndarray]] = []
+    for batch_start in range(0, len(starts), batch_size):
+        batch_starts = starts[batch_start : batch_start + batch_size]
+        contexts: List[np.ndarray] = []
+        intervals: List[Tuple[float, float]] = []
+
+        for start in batch_starts:
+            end = min(start + frame_samples, audio.shape[0])
+            center = start + ((end - start) // 2)
+            contexts.append(
+                _extract_centered_context(
+                    audio, center_sample=center, context_samples=context_samples
+                )
             )
-        result["audio_tag_frames"] = frame_list
+            intervals.append((start / sr, end / sr))
+
+        inputs = feature_extractor(contexts, sampling_rate=sr, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            logits = model(**inputs).logits
+        probs = (
+            torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32, copy=False)
+        )
+
+        for (t0, t1), frame_probs in zip(intervals, probs):
+            frames.append((t0, t1, frame_probs))
+
+    return frames
+
+
+def _tag_audio(
+    audio: np.ndarray,
+    sr: int,
+    model,
+    feature_extractor,
+    label_indices: Sequence[int],
+    label_names: Sequence[str],
+    round_digits: Optional[int],
+    frame_seconds: float,
+    frame_hop: float,
+    context_seconds: float,
+    batch_size: int,
+    device: str,
+    save_raw_frames: bool,
+    raw_top_k: int,
+    segment_start: float = 0.0,
+) -> Dict[str, object]:
+    frames = _predict_framewise(
+        model=model,
+        feature_extractor=feature_extractor,
+        audio=audio,
+        sr=sr,
+        frame_seconds=frame_seconds,
+        frame_hop=frame_hop,
+        context_seconds=context_seconds,
+        batch_size=batch_size,
+        device=device,
+    )
+
+    if not frames:
+        result: Dict[str, object] = {
+            "audio_tags_source": "framewise_max",
+            "audio_tags": _round_probs(
+                {label: 0.0 for label in label_names}, round_digits
+            ),
+            "audio_tag_frames": [],
+        }
+        if save_raw_frames:
+            result["audio_tag_frames_raw"] = []
+        return result
+
+    selected_probs = np.stack(
+        [[float(probs[idx]) for idx in label_indices] for _, _, probs in frames],
+        axis=0,
+    )
+    max_probs = selected_probs.max(axis=0)
+
+    frame_entries = []
+    raw_entries = []
+    for t0, t1, probs in frames:
+        frame_tags = {
+            label: float(probs[idx]) for label, idx in zip(label_names, label_indices)
+        }
+        best_idx = int(np.argmax(probs))
+        frame_entries.append(
+            {
+                "start": segment_start + t0,
+                "end": segment_start + t1,
+                "top_label": model.config.id2label[best_idx],
+                "audio_tags": _round_probs(frame_tags, round_digits),
+            }
+        )
 
         if save_raw_frames:
-            raw_list = []
-            for start, end, probs in raw_frames:
-                frame_tags = {
-                    label: float(probs[idx])
-                    for label, idx in zip(label_names, label_indices)
+            top_idx = np.argsort(-probs)[: max(raw_top_k, 1)]
+            top_labels = [
+                {"label": model.config.id2label[int(i)], "score": float(probs[int(i)])}
+                for i in top_idx
+            ]
+            if round_digits is not None:
+                for item in top_labels:
+                    item["score"] = round(item["score"], round_digits)
+            raw_entries.append(
+                {
+                    "start": segment_start + t0,
+                    "end": segment_start + t1,
+                    "top_labels": top_labels,
                 }
-                raw_list.append(
-                    {
-                        "start": (segment_start or 0.0) + start,
-                        "end": (segment_start or 0.0) + end,
-                        "audio_tags": _round_probs(frame_tags, round_digits),
-                    }
-                )
-            result["audio_tag_frames_raw"] = raw_list
+            )
+
+    result = {
+        "audio_tags_source": "framewise_max",
+        "audio_tags": _round_probs(
+            {label: float(value) for label, value in zip(label_names, max_probs)},
+            round_digits,
+        ),
+        "audio_tag_frames": frame_entries,
+    }
+
+    if save_raw_frames:
+        result["audio_tag_frames_raw"] = raw_entries
 
     return result
 
@@ -345,21 +336,21 @@ def _tag_segment(
 def _tag_entry(
     entry: Dict,
     model,
-    sed_model,
-    label_indices: List[int],
-    label_names: List[str],
+    feature_extractor,
+    label_indices: Sequence[int],
+    label_names: Sequence[str],
     base_dir: Path,
     sample_rate: int,
-    chunk_seconds: float,
-    batch_size: int,
-    min_seconds: float,
-    round_digits: Optional[int],
-    framewise: bool,
     frame_seconds: float,
-    hop_seconds: float,
+    frame_hop: float,
+    context_seconds: float,
+    batch_size: int,
+    round_digits: Optional[int],
     save_raw_frames: bool,
+    raw_top_k: int,
     cache_audio: bool,
     audio_cache: Dict[Path, Tuple[np.ndarray, int]],
+    device: str,
 ) -> Dict:
     segments_key = None
     segments = None
@@ -378,6 +369,7 @@ def _tag_entry(
         if audio_path is None:
             logger.warning("No audio path found for entry; skipping tagging.")
             continue
+
         if not audio_path.is_absolute():
             audio_path = (base_dir / audio_path).resolve()
         if not audio_path.exists():
@@ -385,122 +377,63 @@ def _tag_entry(
             continue
 
         cache = audio_cache if cache_audio else {}
-        audio, sr = _load_audio(audio_path, sample_rate, cache)
-        # Audio clips in this dataset are already cut. Always tag the full clip.
-        segment_audio = audio
-        frame_offset = None
-        tags = _tag_segment(
-            model,
-            sed_model,
-            segment_audio,
-            sr,
-            label_indices,
-            label_names,
-            chunk_seconds=chunk_seconds,
-            batch_size=batch_size,
-            min_seconds=min_seconds,
-            round_digits=round_digits,
-            framewise=framewise,
-            frame_seconds=frame_seconds,
-            hop_seconds=hop_seconds,
-            segment_start=frame_offset,
-            save_raw_frames=save_raw_frames,
+        audio, sr = _load_audio(audio_path, target_sr=sample_rate, cache=cache)
+
+        segment.update(
+            _tag_audio(
+                audio=audio,
+                sr=sr,
+                model=model,
+                feature_extractor=feature_extractor,
+                label_indices=label_indices,
+                label_names=label_names,
+                round_digits=round_digits,
+                frame_seconds=frame_seconds,
+                frame_hop=frame_hop,
+                context_seconds=context_seconds,
+                batch_size=batch_size,
+                device=device,
+                save_raw_frames=save_raw_frames,
+                raw_top_k=raw_top_k,
+                segment_start=0.0,
+            )
         )
-        segment.update(tags)
 
     if segments_key:
         entry[segments_key] = segments
     return entry
 
 
+def _iter_jsonl(path: Path) -> Iterable[Tuple[int, Dict]]:
+    with open(path, "r", encoding="utf-8") as infile:
+        for line_num, line in enumerate(infile, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                yield line_num, json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                logger.warning("Skipping line %d: JSON decode error: %s", line_num, exc)
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Audio pattern recognition using PANNs AudioSet tagging",
-    )
+    parser = argparse.ArgumentParser(description="Framewise AudioSet tagging with AST")
+    parser.add_argument("manifest", type=Path, help="Path to manifest.jsonl")
+    parser.add_argument("-o", "--output", type=Path, help="Output JSONL path")
+    parser.add_argument("--model-id", type=str, default=DEFAULT_MODEL_ID)
     parser.add_argument(
-        "manifest",
-        type=Path,
-        help="Path to manifest.jsonl",
+        "--device", choices=["cpu", "cuda"], help="Inference device (default: auto)"
     )
-    parser.add_argument(
-        "-o",
-        "--output",
-        type=Path,
-        help="Output JSONL path (default: <manifest>.tagged.jsonl)",
-    )
-    parser.add_argument(
-        "--device",
-        choices=["cpu", "cuda"],
-        help="Inference device (default: auto)",
-    )
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=None,
-        help="Checkpoint path for PANNs (default: panns_inference default)",
-    )
-    parser.add_argument(
-        "--sample-rate",
-        type=int,
-        default=32000,
-        help="Sample rate for inference (default: 32000)",
-    )
-    parser.add_argument(
-        "--chunk-seconds",
-        type=float,
-        default=10.0,
-        help="Chunk length for long segments (default: 10s)",
-    )
-    parser.add_argument(
-        "--min-seconds",
-        type=float,
-        default=0.2,
-        help="Minimum segment length to tag (default: 0.2s)",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=8,
-        help="Batch size for inference (default: 8)",
-    )
-    parser.add_argument(
-        "--round",
-        type=int,
-        default=4,
-        help="Round tag probabilities to N digits (use -1 to disable)",
-    )
-    parser.add_argument(
-        "--framewise",
-        action="store_true",
-        help="Enable framewise tagging using PANNs SoundEventDetection",
-    )
-    parser.add_argument(
-        "--frame-seconds",
-        type=float,
-        default=2.0,
-        help="Aggregate framewise tags into windows (default: 2.0s, set 0 to keep raw)",
-    )
-    parser.add_argument(
-        "--frame-hop",
-        type=float,
-        default=1.0,
-        help="Hop size in seconds for framewise aggregation (default: 1.0s)",
-    )
-    parser.add_argument(
-        "--save-raw-frames",
-        action="store_true",
-        help="Also store full-resolution SED frames in audio_tag_frames_raw",
-    )
-    parser.add_argument(
-        "--minimal-output",
-        action="store_true",
-        help="Write a slim JSONL with only audio_path, text, and tagging outputs",
-    )
-    parser.add_argument(
-        "--no-cache",
-        action="store_true",
-        help="Disable caching full audio files in memory",
-    )
+    parser.add_argument("--sample-rate", type=int, default=16000)
+    parser.add_argument("--frame-seconds", type=float, default=0.25)
+    parser.add_argument("--frame-hop", type=float, default=0.125)
+    parser.add_argument("--context-seconds", type=float, default=1.0)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--round", type=int, default=3, help="Use -1 to disable")
+    parser.add_argument("--save-raw-frames", action="store_true")
+    parser.add_argument("--raw-top-k", type=int, default=10)
+    parser.add_argument("--minimal-output", action="store_true")
+    parser.add_argument("--no-cache", action="store_true")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -511,95 +444,63 @@ def main() -> int:
     if not args.manifest.exists():
         logger.error("Manifest not found: %s", args.manifest)
         return 1
-
-    try:
-        from panns_inference import (
-            AudioTagging,
-            SoundEventDetection,
-            labels as panns_labels,
-        )
-    except Exception as exc:
-        logger.error(
-            "panns_inference is required. Install it (pip install panns-inference)."
-        )
-        logger.error("Import error: %s", exc)
+    if args.frame_seconds <= 0 or args.frame_hop <= 0 or args.context_seconds <= 0:
+        logger.error("--frame-seconds, --frame-hop and --context-seconds must be > 0")
         return 1
 
-    device = args.device
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = AudioTagging(checkpoint_path=args.checkpoint, device=device)
-    if not hasattr(model, "num_classes"):
-        model.num_classes = len(panns_labels)
+    logger.info("Loading model: %s", args.model_id)
+    feature_extractor = AutoFeatureExtractor.from_pretrained(args.model_id)
+    model = AutoModelForAudioClassification.from_pretrained(args.model_id)
+    model.to(device)
+    model.eval()
 
-    sed_model = None
-    if args.framewise:
-        sed_model = SoundEventDetection(checkpoint_path=args.checkpoint, device=device)
-        if not hasattr(sed_model, "num_classes"):
-            sed_model.num_classes = len(panns_labels)
-
-    label_indices, label_names = _resolve_label_indices(panns_labels, TARGET_LABELS)
+    model_labels = model.config.id2label
+    label_indices, label_names = _resolve_label_indices(model_labels, TARGET_LABELS)
     if not label_indices:
-        logger.error("None of the target labels were resolved. Aborting.")
+        logger.error("No target labels resolved against model labels. Aborting.")
         return 1
 
     round_digits = None if args.round < 0 else args.round
-
-    output_path = args.output
-    if output_path is None:
-        output_path = args.manifest.with_suffix(".tagged.jsonl")
-
+    output_path = args.output or args.manifest.with_suffix(".tagged.jsonl")
     audio_cache: Dict[Path, Tuple[np.ndarray, int]] = {}
 
-    with (
-        open(args.manifest, "r", encoding="utf-8") as infile,
-        open(output_path, "w", encoding="utf-8") as outfile,
-    ):
-        for line_num, line in enumerate(infile, start=1):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            try:
-                entry = json.loads(stripped)
-            except json.JSONDecodeError as exc:
-                logger.warning("Skipping line %d: JSON decode error: %s", line_num, exc)
-                continue
-
+    with open(output_path, "w", encoding="utf-8") as outfile:
+        for _, entry in _iter_jsonl(args.manifest):
             entry.setdefault(
                 "audio_tagging",
                 {
-                    "labels": label_names,
+                    "model_id": args.model_id,
+                    "mode": "framewise_ast",
                     "sample_rate": args.sample_rate,
-                    "checkpoint": args.checkpoint,
-                    "chunk_seconds": args.chunk_seconds,
-                    "framewise": args.framewise,
-                    "frame_seconds": args.frame_seconds if args.framewise else None,
-                    "frame_hop": args.frame_hop if args.framewise else None,
-                    "frame_mode": "sed" if args.framewise else None,
-                    "save_raw_frames": args.save_raw_frames if args.framewise else None,
+                    "frame_seconds": args.frame_seconds,
+                    "frame_hop": args.frame_hop,
+                    "context_seconds": args.context_seconds,
+                    "labels": label_names,
                 },
             )
 
             tagged = _tag_entry(
-                entry,
-                model,
-                sed_model,
-                label_indices,
-                label_names,
+                entry=entry,
+                model=model,
+                feature_extractor=feature_extractor,
+                label_indices=label_indices,
+                label_names=label_names,
                 base_dir=args.manifest.parent,
                 sample_rate=args.sample_rate,
-                chunk_seconds=args.chunk_seconds,
-                batch_size=args.batch_size,
-                min_seconds=args.min_seconds,
-                round_digits=round_digits,
-                framewise=args.framewise,
                 frame_seconds=args.frame_seconds,
-                hop_seconds=args.frame_hop,
+                frame_hop=args.frame_hop,
+                context_seconds=args.context_seconds,
+                batch_size=args.batch_size,
+                round_digits=round_digits,
                 save_raw_frames=args.save_raw_frames,
+                raw_top_k=args.raw_top_k,
                 cache_audio=not args.no_cache,
                 audio_cache=audio_cache,
+                device=device,
             )
+
             if args.minimal_output:
                 slim = {
                     "audio_path": tagged.get("audio_path")
@@ -608,6 +509,7 @@ def main() -> int:
                     or tagged.get("audio"),
                     "text": tagged.get("text"),
                     "audio_tagging": tagged.get("audio_tagging"),
+                    "audio_tags_source": tagged.get("audio_tags_source"),
                     "audio_tags": tagged.get("audio_tags"),
                     "audio_tag_frames": tagged.get("audio_tag_frames"),
                 }
