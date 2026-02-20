@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH --time=72:00:00
 #SBATCH --cpus-per-task=8
-#SBATCH --job-name ser_youtube
+#SBATCH --job-name apr_youtube
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
 #SBATCH --partition=performance
 #SBATCH --nodes=1
 #SBATCH --nodelist=calc-g-002,calc-g-004,calc-g-006
-#SBATCH --out=logs/ser_youtube_%j.out
-#SBATCH --error=logs/ser_youtube_%j.err
+#SBATCH --out=logs/apr_youtube_%j.out
+#SBATCH --error=logs/apr_youtube_%j.err
 
 set -euo pipefail
 
@@ -41,13 +41,11 @@ manifest="${ROOT_DIR}/manifest.jsonl"
 [ -f "${manifest}" ] || { echo "Manifest not found: ${manifest}"; exit 1; }
 
 dir="$(dirname "${manifest}")"
-ser_output="${dir}/manifest.emotion.jsonl"
+apr_output="${dir}/manifest.tagged.jsonl"
 
-echo "SER: ${manifest}"
-python ser.py "${manifest}" \
-    --output "${ser_output}" \
+echo "APR: ${manifest}"
+python audio_pattern_recognition.py "${manifest}" \
+    --output "${apr_output}" \
     --batch-size 16 \
-    --chunk-seconds 10 \
-    --min-seconds 0.2 \
-    --slim-output \
-    --framewise
+    --round 3 \
+    --minimal-output

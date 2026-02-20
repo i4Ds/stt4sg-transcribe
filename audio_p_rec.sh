@@ -49,12 +49,7 @@ for d in "${ROOT_DIR}"/*; do
     echo "Audio Pattern: ${manifest}"
     python audio_pattern_recognition.py "${manifest}" \
         --output "${output}" \
-        --batch-size 8 \
-        --chunk-seconds 10 \
-        --min-seconds 0.2 \
-        --framewise \
-        --frame-seconds 2.0 \
-        --frame-hop 1.0 \
-        --round 6 \
+        --batch-size 16 \
+        --round 3 \
         --minimal-output
 done

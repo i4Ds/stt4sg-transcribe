@@ -50,6 +50,4 @@ python ser.py "${manifest}" \
     --chunk-seconds 10 \
     --min-seconds 0.2 \
     --slim-output \
-    --framewise \
-    --frame-seconds 2.0 \
-    --frame-hop 1.0
+    --framewise
