@@ -31,5 +31,6 @@ for d in "$ROOT"/*; do
     --skip-existing \
     --vad-method silero \
     --vad-params '{"threshold": 0.5, "neg_threshold": 0.365}' \
-    --no-logs
+    --no-logs \
+    --add_lock
 done

@@ -1,7 +1,7 @@
 """
 Speech Emotion Recognition (SER) tagging using MERaLiON-SER-v1.
 
-Reads a JSONL manifest and appends emotion predictions per segment.
+Reads a JSONL manifest and appends framewise emotion predictions per segment.
 """
 
 import argparse
@@ -115,57 +115,6 @@ def _infer_batch(
     return logits, dims_arr
 
 
-def _predict_clipwise(
-    model,
-    processor,
-    audio: np.ndarray,
-    sr: int,
-    chunk_seconds: float,
-    batch_size: int,
-    min_seconds: float,
-    device: str,
-) -> Tuple[np.ndarray, np.ndarray]:
-    if audio.size == 0:
-        return np.zeros((len(EMO_LABELS),), dtype=np.float32), np.zeros((3,))
-
-    chunk_samples = int(chunk_seconds * sr)
-    min_samples = int(min_seconds * sr)
-    if chunk_samples <= 0 or audio.shape[0] <= chunk_samples:
-        logits, dims = _infer_batch(model, processor, [audio], device)
-        probs = _softmax(logits)[0]
-        return probs, dims[0]
-
-    chunks: List[np.ndarray] = []
-    weights: List[float] = []
-    for start in range(0, audio.shape[0], chunk_samples):
-        chunk = audio[start : start + chunk_samples]
-        if chunk.shape[0] < min_samples:
-            continue
-        chunks.append(chunk)
-        weights.append(float(chunk.shape[0]))
-
-    if not chunks:
-        logits, dims = _infer_batch(model, processor, [audio], device)
-        probs = _softmax(logits)[0]
-        return probs, dims[0]
-
-    probs_list: List[np.ndarray] = []
-    dims_list: List[np.ndarray] = []
-    for idx in range(0, len(chunks), batch_size):
-        batch = chunks[idx : idx + batch_size]
-        logits, dims = _infer_batch(model, processor, batch, device)
-        probs_list.append(_softmax(logits))
-        dims_list.append(dims)
-
-    probs_arr = np.concatenate(probs_list, axis=0)
-    dims_arr = np.concatenate(dims_list, axis=0)
-    weights_arr = np.array(weights, dtype=np.float32)
-    norm = max(weights_arr.sum(), 1.0)
-    probs = (probs_arr * weights_arr[:, None]).sum(axis=0) / norm
-    dims = (dims_arr * weights_arr[:, None]).sum(axis=0) / norm
-    return probs, dims
-
-
 def _predict_framewise(
     model,
     processor,
@@ -250,82 +199,55 @@ def _tag_segment(
     processor,
     audio: np.ndarray,
     sr: int,
-    chunk_seconds: float,
     batch_size: int,
     min_seconds: float,
     round_digits: Optional[int],
-    framewise: bool,
     frame_seconds: float,
     hop_seconds: float,
     context_seconds: float,
     segment_start: Optional[float],
     device: str,
 ) -> Dict[str, object]:
-    probs, dims = _predict_clipwise(
+    frames = _predict_framewise(
         model,
         processor,
         audio,
         sr,
-        chunk_seconds=chunk_seconds,
+        frame_seconds=frame_seconds,
+        hop_seconds=hop_seconds,
+        context_seconds=context_seconds,
         batch_size=batch_size,
         min_seconds=min_seconds,
         device=device,
     )
-    emo_idx = int(np.argmax(probs)) if probs.size else 0
-    emo_label = EMO_LABELS[emo_idx] if EMO_LABELS else "unknown"
-    tag_probs = {label: float(prob) for label, prob in zip(EMO_LABELS, probs)}
-    result = {
-        "emotion": {
-            "label": emo_label,
-            "confidence": float(np.max(probs)) if probs.size else 0.0,
-            "probs": _round_probs(tag_probs, round_digits),
-            "vad": _round_list(
-                dims.tolist() if hasattr(dims, "tolist") else dims, round_digits
-            ),
-        }
-    }
 
-    if framewise:
-        frames = _predict_framewise(
-            model,
-            processor,
-            audio,
-            sr,
-            frame_seconds=frame_seconds,
-            hop_seconds=hop_seconds,
-            context_seconds=context_seconds,
-            batch_size=batch_size,
-            min_seconds=min_seconds,
-            device=device,
+    frame_list = []
+    for start, end, f_probs, f_dims in frames:
+        f_idx = int(np.argmax(f_probs)) if f_probs.size else 0
+        f_label = EMO_LABELS[f_idx] if EMO_LABELS else "unknown"
+        frame_list.append(
+            {
+                "start": (segment_start or 0.0) + start,
+                "end": (segment_start or 0.0) + end,
+                "emotion": {
+                    "label": f_label,
+                    "confidence": float(np.max(f_probs)) if f_probs.size else 0.0,
+                    "probs": _round_probs(
+                        {
+                            label: float(prob)
+                            for label, prob in zip(EMO_LABELS, f_probs)
+                        },
+                        round_digits,
+                    ),
+                    "vad": _round_list(
+                        f_dims.tolist() if hasattr(f_dims, "tolist") else f_dims,
+                        round_digits,
+                    ),
+                },
+            }
         )
-        frame_list = []
-        for start, end, f_probs, f_dims in frames:
-            f_idx = int(np.argmax(f_probs)) if f_probs.size else 0
-            f_label = EMO_LABELS[f_idx] if EMO_LABELS else "unknown"
-            frame_list.append(
-                {
-                    "start": (segment_start or 0.0) + start,
-                    "end": (segment_start or 0.0) + end,
-                    "emotion": {
-                        "label": f_label,
-                        "confidence": float(np.max(f_probs)) if f_probs.size else 0.0,
-                        "probs": _round_probs(
-                            {
-                                label: float(prob)
-                                for label, prob in zip(EMO_LABELS, f_probs)
-                            },
-                            round_digits,
-                        ),
-                        "vad": _round_list(
-                            f_dims.tolist() if hasattr(f_dims, "tolist") else f_dims,
-                            round_digits,
-                        ),
-                    },
-                }
-            )
-        result["emotion_frames"] = frame_list
 
-    return result
+    return {"emotion_frames": frame_list}
 
 
 def _tag_entry(
@@ -334,11 +256,9 @@ def _tag_entry(
     processor,
     base_dir: Path,
     sample_rate: int,
-    chunk_seconds: float,
     batch_size: int,
     min_seconds: float,
     round_digits: Optional[int],
-    framewise: bool,
     frame_seconds: float,
     hop_seconds: float,
     context_seconds: float,
@@ -381,11 +301,9 @@ def _tag_entry(
             processor,
             segment_audio,
             sr,
-            chunk_seconds=chunk_seconds,
             batch_size=batch_size,
             min_seconds=min_seconds,
             round_digits=round_digits,
-            framewise=framewise,
             frame_seconds=frame_seconds,
             hop_seconds=hop_seconds,
             context_seconds=context_seconds,
@@ -454,12 +372,6 @@ def main() -> int:
         help="Sample rate for inference (default: 16000)",
     )
     parser.add_argument(
-        "--chunk-seconds",
-        type=float,
-        default=10.0,
-        help="Chunk length for long segments (default: 10s)",
-    )
-    parser.add_argument(
         "--min-seconds",
         type=float,
         default=0.2,
@@ -476,11 +388,6 @@ def main() -> int:
         type=int,
         default=4,
         help="Round probabilities and VAD to N digits (default: 4)",
-    )
-    parser.add_argument(
-        "--framewise",
-        action="store_true",
-        help="Enable framewise tagging with sliding windows",
     )
     parser.add_argument(
         "--frame-seconds",
@@ -584,13 +491,9 @@ def main() -> int:
                 {
                     "repo": args.repo,
                     "sample_rate": args.sample_rate,
-                    "chunk_seconds": args.chunk_seconds,
-                    "framewise": args.framewise,
-                    "frame_seconds": args.frame_seconds if args.framewise else None,
-                    "frame_hop": args.frame_hop if args.framewise else None,
-                    "context_seconds": (
-                        args.context_seconds if args.framewise else None
-                    ),
+                    "frame_seconds": args.frame_seconds,
+                    "frame_hop": args.frame_hop,
+                    "context_seconds": args.context_seconds,
                     "labels": EMO_LABELS,
                 },
             )
@@ -601,11 +504,9 @@ def main() -> int:
                 processor,
                 base_dir=args.manifest.parent,
                 sample_rate=args.sample_rate,
-                chunk_seconds=args.chunk_seconds,
                 batch_size=args.batch_size,
                 min_seconds=args.min_seconds,
                 round_digits=args.round,
-                framewise=args.framewise,
                 frame_seconds=args.frame_seconds,
                 hop_seconds=args.frame_hop,
                 context_seconds=args.context_seconds,

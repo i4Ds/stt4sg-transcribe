@@ -47,7 +47,5 @@ echo "SER: ${manifest}"
 python ser.py "${manifest}" \
     --output "${ser_output}" \
     --batch-size 16 \
-    --chunk-seconds 10 \
     --min-seconds 0.2 \
-    --slim-output \
-    --framewise
+    --slim-output
