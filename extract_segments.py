@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import os
@@ -22,6 +23,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+import librosa
+import numpy as np
 from pydub import AudioSegment
 
 logger = logging.getLogger("extract_segments")
@@ -84,6 +87,7 @@ class SegmentInfo:
     is_merged: bool = False
     merge_count: int = 1
     original_segments: List[Dict] = field(default_factory=list)
+    source_metrics: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSONL output. audio_path added separately as first key."""
@@ -104,6 +108,7 @@ class SegmentInfo:
             "avg_word_score": self.avg_word_score,
             "is_merged": self.is_merged,
             "merge_count": self.merge_count,
+            "source_metrics": self.source_metrics,
             # source_audio at the end
             "source_audio": self.source_audio,
             "source_json": self.source_json,
@@ -387,12 +392,12 @@ def cut_audio_segment(
     output_path: Path,
     format: str = "flac",
     frame_ms: int = 10,
-) -> bool:
+) -> tuple[bool, Optional[AudioSegment]]:
     """
     Cut a segment from audio and save to file.
 
     Uses floor for start and ceil for end, rounding to frame boundaries.
-    Silero VAD uses 400ms frames by default (speech_pad_ms), so we round
+    Silero VAD timestamps are at 10ms resolution, so we round
     END up to the nearest frame boundary to avoid cutting off audio.
 
     Args:
@@ -401,7 +406,7 @@ def cut_audio_segment(
         end: End time in seconds
         output_path: Where to save the segment
         format: Output format (flac, wav, mp3)
-        frame_ms: Frame size in ms for rounding (default: 400 for Silero)
+        frame_ms: Frame size in ms for rounding (default: 10 for Silero)
     """
     import math
 
@@ -420,10 +425,95 @@ def cut_audio_segment(
 
         segment = audio[start_ms:end_ms]
         segment.export(str(output_path), format=format)
-        return True
+        return True, segment
     except Exception as e:
         logger.error(f"Failed to cut segment {start}-{end}: {e}")
-        return False
+        return False, None
+
+
+def _audiosegment_to_mono_float32(audio: AudioSegment) -> tuple[np.ndarray, int]:
+    """Convert pydub AudioSegment to mono float32 waveform in [-1, 1]."""
+    samples = np.array(audio.get_array_of_samples())
+    if audio.channels > 1:
+        samples = samples.reshape((-1, audio.channels)).mean(axis=1)
+    scale = float(1 << (8 * audio.sample_width - 1))
+    y = samples.astype(np.float32, copy=False) / max(scale, 1.0)
+    y = np.clip(y, -1.0, 1.0)
+    return y, int(audio.frame_rate)
+
+
+def _compute_segment_metrics(
+    audio: AudioSegment,
+    frame_ms: int = 20,
+    eps: float = 1e-9,
+) -> Dict[str, Any]:
+    """
+    Compute cheap per-segment metrics from the final cut waveform.
+
+    Metrics:
+      - snr_db (signal RMS vs lowest 10% RMS noise proxy)
+      - music heuristic using spectral flatness + harmonic ratio (librosa HPSS)
+    """
+    y, sr = _audiosegment_to_mono_float32(audio)
+    if y.size == 0:
+        return {"error": "empty_audio"}
+
+    frame_len = max(1, int(sr * frame_ms / 1000))
+    n_frames = int(np.ceil(y.size / frame_len))
+    pad = n_frames * frame_len - y.size
+    if pad > 0:
+        y = np.pad(y, (0, pad))
+    frames = y.reshape(n_frames, frame_len)
+
+    rms = np.sqrt(np.mean(np.square(frames), axis=1) + eps)
+    signal_rms = float(np.median(rms))
+    k = max(1, int(0.1 * rms.size))
+    lowest = np.partition(rms, k - 1)[:k]
+    noise_rms = float(np.median(lowest))
+    noise_method = "lowest_10pct_rms_proxy"
+    snr_db = float(20.0 * np.log10((signal_rms + eps) / (noise_rms + eps)))
+
+    max_eval_frames = 4000
+    if frames.shape[0] > max_eval_frames:
+        idx = np.linspace(0, frames.shape[0] - 1, max_eval_frames, dtype=int)
+        frames = frames[idx]
+
+    window = np.hanning(frame_len).astype(np.float32)
+    spectrum = np.fft.rfft(frames * window[None, :], axis=1)
+    power = (np.abs(spectrum) ** 2) + eps
+    flatness_arr = np.exp(np.mean(np.log(power), axis=1)) / np.mean(power, axis=1)
+    music_flatness = float(np.median(flatness_arr))
+
+    music_wave = frames.reshape(-1)
+    stft = librosa.stft(music_wave, n_fft=1024, hop_length=256, center=False)
+    mag = np.abs(stft)
+    harmonic_mag, percussive_mag = librosa.decompose.hpss(mag)
+    harmonic_energy = float(np.sum(harmonic_mag**2))
+    percussive_energy = float(np.sum(percussive_mag**2))
+    harm_ratio = float(harmonic_energy / (percussive_energy + eps))
+    harm_ratio_method = "librosa_hpss"
+
+    harm_component = harm_ratio / (harm_ratio + 1.0)
+    tonal_component = 1.0 - float(np.clip(music_flatness, 0.0, 1.0))
+    music_score = float(np.clip(harm_component * tonal_component, 0.0, 1.0))
+    music_likely = bool(harm_ratio > 1.5 and music_flatness < 0.35)
+    eval_frames = int(frames.shape[0])
+
+    return {
+        "analysis_frame_ms": int(frame_ms),
+        "signal_rms": round(signal_rms, 8),
+        "noise_rms": round(noise_rms, 8),
+        "noise_rms_method": noise_method,
+        "snr_db": round(snr_db, 3),
+        "music_eval_frame_count": eval_frames,
+        "music_flatness": (
+            round(music_flatness, 6) if music_flatness is not None else None
+        ),
+        "music_harm_ratio": round(harm_ratio, 6) if harm_ratio is not None else None,
+        "music_harm_ratio_method": harm_ratio_method,
+        "music_score": round(music_score, 6) if music_score is not None else None,
+        "music_likely": music_likely,
+    }
 
 
 def process_json_file(
@@ -473,7 +563,7 @@ def process_json_file(
 
     if not audio_file or not Path(audio_file).exists():
         logger.error(f"Audio file not found: {audio_file}")
-        return [], []
+        return [], [], input_stats
 
     # Segments already have purity/coverage from batch_transcribe.py
     # No need to attach_diarization_metrics - they're already included
@@ -591,20 +681,13 @@ def process_json_file(
         segment_filename = f"{source_stem}_{start_str}-{end_str}.{audio_format}"
         segment_path = segment_dir / segment_filename
 
-        # Determine cut_end: use START of NEXT segment if available
-        # This avoids cutting off trailing audio between segments
-        if i + 1 < len(final):
-            next_start = final[i + 1].get("start", seg["end"])
-            # Use next segment's start, but cap at a reasonable max (e.g., +2s)
-            max_end = seg["end"] + 1.0
-            cut_end = min(next_start, max_end)
-        else:
-            # Last segment: use its own end timestamp
-            cut_end = seg["end"]
+        # Use segment end directly; boundary rounding already adds minimal safety.
+        cut_end = seg["end"]
 
-        # Cut audio with frame-aligned boundaries (Silero uses 400ms frames)
+        # Cut audio with frame-aligned boundaries (Silero uses 10ms frames)
+        segment_metrics = None
         if not dry_run and audio:
-            success = cut_audio_segment(
+            success, cut_segment = cut_audio_segment(
                 audio,
                 seg["start"],
                 cut_end,
@@ -614,6 +697,10 @@ def process_json_file(
             )
             if not success:
                 continue
+            if cut_segment is not None:
+                segment_metrics = _compute_segment_metrics(
+                    cut_segment, frame_ms=frame_ms
+                )
 
         # Create segment info
         info = SegmentInfo(
@@ -643,6 +730,7 @@ def process_json_file(
             avg_word_score=calculate_avg_word_score(seg),
             is_merged=seg.get("_is_merged", False),
             merge_count=seg.get("_merge_count", 1),
+            source_metrics=segment_metrics,
         )
 
         # Add output path to dict for JSONL - audio_path as FIRST key
@@ -741,11 +829,17 @@ def main():
     parser.add_argument(
         "--frame-ms",
         type=int,
-        default=400,
-        help="Frame size in ms for rounding timestamps (Silero uses 400ms)",
+        default=10,
+        help="Frame size in ms for rounding timestamps (Silero uses 10ms)",
     )
     parser.add_argument(
         "--limit", type=int, help="Limit number of JSON files to process"
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=min(8, os.cpu_count() or 1),
+        help="Number of parallel worker processes (set 1 to disable parallelism)",
     )
     parser.add_argument(
         "--no-summary",
@@ -805,7 +899,6 @@ def main():
         logger.info("DRY RUN - no files will be created")
 
     # Process all files
-    all_segments = []
     stats = {
         "total_json_files": len(json_files),
         "processed_files": 0,
@@ -818,24 +911,30 @@ def main():
         "rejection_reasons": {},
     }
 
-    all_rejected = []
+    jsonl_path = output_dir / "manifest.jsonl"
+    rejected_path = output_dir / "rejected.jsonl"
+    logger.info(f"Writing manifest incrementally to {jsonl_path}")
+    logger.info(f"Writing rejected segments incrementally to {rejected_path}")
 
-    for json_path in json_files:
-        logger.info(f"Processing: {json_path}")
+    max_workers = int(args.workers)
+    if max_workers > 1:
+        logger.info(f"Parallel processing enabled with {max_workers} workers")
+    else:
+        logger.info("Parallel processing disabled (workers=1)")
 
-        try:
-            segments, rejected, input_stats = process_json_file(
-                json_path,
-                config,
-                output_dir,
-                input_dir,
-                args.audio_format,
-                args.dry_run,
-                frame_ms=args.frame_ms,
-            )
+    with open(jsonl_path, "w", encoding="utf-8") as manifest_f, open(
+        rejected_path, "w", encoding="utf-8"
+    ) as rejected_f:
+        def persist_and_update(
+            segments: List[Dict], rejected: List[Dict], input_stats: Dict[str, Any]
+        ) -> None:
+            for seg in segments:
+                manifest_f.write(json.dumps(seg, ensure_ascii=False) + "\n")
+            for rej in rejected:
+                rejected_f.write(json.dumps(rej, ensure_ascii=False) + "\n")
+            manifest_f.flush()
+            rejected_f.flush()
 
-            all_segments.extend(segments)
-            all_rejected.extend(rejected)
             stats["processed_files"] += 1
             stats["total_segments_in"] += input_stats["segments_in"]
             stats["total_duration_in"] += input_stats["duration_in"]
@@ -847,30 +946,59 @@ def main():
                 speaker = seg.get("speaker", "UNKNOWN")
                 stats["speakers"][speaker] = stats["speakers"].get(speaker, 0) + 1
 
-            # Track rejection reasons
             for rej in rejected:
                 reason = rej.get("reason", "unknown")
                 stats["rejection_reasons"][reason] = (
                     stats["rejection_reasons"].get(reason, 0) + 1
                 )
 
-        except Exception as e:
-            logger.exception(f"Error processing {json_path}: {e}")
+        if max_workers == 1:
+            for json_path in json_files:
+                logger.info(f"Processing: {json_path}")
+                try:
+                    result = process_json_file(
+                        json_path,
+                        config,
+                        output_dir,
+                        input_dir,
+                        args.audio_format,
+                        args.dry_run,
+                        frame_ms=args.frame_ms,
+                    )
+                except Exception as e:
+                    logger.exception(f"Error processing {json_path}: {e}")
+                    continue
+                segments, rejected, input_stats = result
+                persist_and_update(segments, rejected, input_stats)
+        else:
+            future_to_path = {}
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=max_workers
+            ) as executor:
+                for json_path in json_files:
+                    future = executor.submit(
+                        process_json_file,
+                        json_path,
+                        config,
+                        output_dir,
+                        input_dir,
+                        args.audio_format,
+                        args.dry_run,
+                        args.frame_ms,
+                    )
+                    future_to_path[future] = json_path
 
-    # Write JSONL manifest
-    jsonl_path = output_dir / "manifest.jsonl"
-    with open(jsonl_path, "w", encoding="utf-8") as f:
-        for seg in all_segments:
-            f.write(json.dumps(seg, ensure_ascii=False) + "\n")
+                for future in concurrent.futures.as_completed(future_to_path):
+                    json_path = future_to_path[future]
+                    logger.info(f"Completed: {json_path}")
+                    try:
+                        segments, rejected, input_stats = future.result()
+                    except Exception as e:
+                        logger.exception(f"Error processing {json_path}: {e}")
+                        continue
+                    persist_and_update(segments, rejected, input_stats)
 
     logger.info(f"Wrote manifest to {jsonl_path}")
-
-    # Write rejected segments JSONL
-    rejected_path = output_dir / "rejected.jsonl"
-    with open(rejected_path, "w", encoding="utf-8") as f:
-        for rej in all_rejected:
-            f.write(json.dumps(rej, ensure_ascii=False) + "\n")
-
     logger.info(f"Wrote rejected segments to {rejected_path}")
 
     # Calculate dropped stats
