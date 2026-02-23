@@ -4,9 +4,8 @@
 #SBATCH --job-name=yt_podcast_extract_segments
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:0
-#SBATCH --partition=performance
+#SBATCH --partition=top6
 #SBATCH --nodes=1
-#SBATCH --nodelist=calc-g-002,calc-g-004,calc-g-006
 #SBATCH --output=logs/yt_podcast_extract_segments_%j.out
 #SBATCH --error=logs/yt_podcast_extract_segments_%j.err
 

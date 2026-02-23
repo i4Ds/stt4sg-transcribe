@@ -1004,11 +1004,17 @@ def main():
         def persist_and_update(
             segments: List[Dict], rejected: List[Dict], input_stats: Dict[str, Any]
         ) -> None:
+            written_segments = 0
+            written_audio_keys: set[str] = set()
             for seg in segments:
-                manifest_f.write(json.dumps(seg, ensure_ascii=False) + "\n")
                 audio_key = _normalize_audio_key(str(seg.get("audio_path", "")))
+                if audio_key and audio_key in processed_audio_keys:
+                    continue
+                manifest_f.write(json.dumps(seg, ensure_ascii=False) + "\n")
                 if audio_key:
                     processed_audio_keys.add(audio_key)
+                    written_audio_keys.add(audio_key)
+                written_segments += 1
             for rej in rejected:
                 rejected_f.write(json.dumps(rej, ensure_ascii=False) + "\n")
             manifest_f.flush()
@@ -1017,10 +1023,13 @@ def main():
             stats["processed_files"] += 1
             stats["total_segments_in"] += input_stats["segments_in"]
             stats["total_duration_in"] += input_stats["duration_in"]
-            stats["total_segments_out"] += len(segments)
+            stats["total_segments_out"] += written_segments
             stats["total_rejected"] += len(rejected)
 
             for seg in segments:
+                audio_key = _normalize_audio_key(str(seg.get("audio_path", "")))
+                if audio_key and audio_key not in written_audio_keys:
+                    continue
                 stats["total_duration_out"] += seg.get("duration", 0)
                 speaker = seg.get("speaker", "UNKNOWN")
                 stats["speakers"][speaker] = stats["speakers"].get(speaker, 0) + 1

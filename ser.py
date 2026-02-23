@@ -623,12 +623,16 @@ def main() -> int:
                 device=device,
                 slim_output=args.slim_output,
             )
+            wrote_any = False
             if args.slim_output:
                 for slim in tagged:
                     outfile.write(json.dumps(slim, ensure_ascii=False) + "\n")
+                    wrote_any = True
             else:
                 outfile.write(json.dumps(tagged, ensure_ascii=False) + "\n")
-            processed_audio_keys.update(entry_audio_keys)
+                wrote_any = True
+            if wrote_any:
+                processed_audio_keys.update(entry_audio_keys)
 
     logger.info("Emotion-tagged manifest written to %s", output_path)
     return 0
