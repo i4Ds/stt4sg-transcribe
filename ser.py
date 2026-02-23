@@ -7,6 +7,7 @@ Reads a JSONL manifest and appends framewise emotion predictions per segment.
 import argparse
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -52,6 +53,77 @@ def _find_audio_path(entry: Dict, segment: Optional[Dict]) -> Optional[Path]:
         if value:
             return Path(value)
     return None
+
+
+def _resolve_audio_path(
+    entry: Dict,
+    segment: Optional[Dict],
+    base_dir: Path,
+) -> Optional[Path]:
+    audio_path = _find_audio_path(entry, segment)
+    if audio_path is None:
+        return None
+    if not audio_path.is_absolute():
+        audio_path = (base_dir / audio_path).resolve()
+    else:
+        audio_path = audio_path.resolve()
+    return audio_path
+
+
+def _collect_audio_keys(entry: Dict, base_dir: Path) -> List[str]:
+    keys: List[str] = []
+    seen = set()
+    segments: Optional[List[Dict]] = None
+    if isinstance(entry.get("final_segments"), list):
+        segments = entry["final_segments"]
+    elif isinstance(entry.get("segments"), list):
+        segments = entry["segments"]
+    if segments is None:
+        segments = [entry]
+
+    for segment in segments:
+        resolved = _resolve_audio_path(entry, segment, base_dir)
+        if resolved is None:
+            continue
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+    return keys
+
+
+def _load_processed_audio_keys(output_path: Path, base_dir: Path) -> set[str]:
+    processed: set[str] = set()
+    if not output_path.exists():
+        return processed
+
+    with open(output_path, "r", encoding="utf-8") as infile:
+        for line_num, line in enumerate(infile, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                entry = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                logger.warning(
+                    "Ignoring output line %d: JSON decode error: %s", line_num, exc
+                )
+                continue
+            for key in _collect_audio_keys(entry, base_dir):
+                processed.add(key)
+
+    return processed
+
+
+def _write_run_config(output_path: Path, config: Dict[str, object]) -> Path:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    config_path = output_path.with_name(f"{output_path.stem}.config.{ts}.json")
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(config_path, "w", encoding="utf-8") as cfg:
+        json.dump(config, cfg, ensure_ascii=False, indent=2)
+        cfg.write("\n")
+    return config_path
 
 
 def _load_audio(
@@ -182,10 +254,13 @@ def _predict_framewise(
     return results
 
 
-def _round_probs(probs: Dict[str, float], digits: Optional[int]) -> Dict[str, float]:
+def _round_probs(
+    probs: Dict[str, float], digits: Optional[int], min_prob: float
+) -> Dict[str, float]:
+    filtered = {k: float(v) for k, v in probs.items() if float(v) >= min_prob}
     if digits is None:
-        return probs
-    return {k: round(v, digits) for k, v in probs.items()}
+        return filtered
+    return {k: round(v, digits) for k, v in filtered.items()}
 
 
 def _round_list(values: Iterable[float], digits: Optional[int]) -> List[float]:
@@ -205,6 +280,7 @@ def _tag_segment(
     frame_seconds: float,
     hop_seconds: float,
     context_seconds: float,
+    min_prob: float,
     segment_start: Optional[float],
     device: str,
 ) -> Dict[str, object]:
@@ -223,6 +299,13 @@ def _tag_segment(
 
     frame_list = []
     for start, end, f_probs, f_dims in frames:
+        filtered_probs = _round_probs(
+            {label: float(prob) for label, prob in zip(EMO_LABELS, f_probs)},
+            round_digits,
+            min_prob,
+        )
+        if not filtered_probs:
+            continue
         f_idx = int(np.argmax(f_probs)) if f_probs.size else 0
         f_label = EMO_LABELS[f_idx] if EMO_LABELS else "unknown"
         frame_list.append(
@@ -232,13 +315,7 @@ def _tag_segment(
                 "emotion": {
                     "label": f_label,
                     "confidence": float(np.max(f_probs)) if f_probs.size else 0.0,
-                    "probs": _round_probs(
-                        {
-                            label: float(prob)
-                            for label, prob in zip(EMO_LABELS, f_probs)
-                        },
-                        round_digits,
-                    ),
+                    "probs": filtered_probs,
                     "vad": _round_list(
                         f_dims.tolist() if hasattr(f_dims, "tolist") else f_dims,
                         round_digits,
@@ -247,7 +324,10 @@ def _tag_segment(
             }
         )
 
-    return {"emotion_frames": frame_list}
+    return {
+        "emotion_tags_source": "framewise_meralion_ser",
+        "emotion_frames": frame_list,
+    }
 
 
 def _tag_entry(
@@ -262,6 +342,7 @@ def _tag_entry(
     frame_seconds: float,
     hop_seconds: float,
     context_seconds: float,
+    min_prob: float,
     cache_audio: bool,
     audio_cache: Dict[Path, Tuple[np.ndarray, int]],
     device: str,
@@ -281,12 +362,10 @@ def _tag_entry(
 
     results = []
     for segment in segments:
-        audio_path = _find_audio_path(entry, segment)
+        audio_path = _resolve_audio_path(entry, segment, base_dir)
         if audio_path is None:
             logger.warning("No audio path found for entry; skipping tagging.")
             continue
-        if not audio_path.is_absolute():
-            audio_path = (base_dir / audio_path).resolve()
         if not audio_path.exists():
             logger.warning("Audio file not found: %s", audio_path)
             continue
@@ -307,6 +386,7 @@ def _tag_entry(
             frame_seconds=frame_seconds,
             hop_seconds=hop_seconds,
             context_seconds=context_seconds,
+            min_prob=min_prob,
             segment_start=segment_start_for_frames,
             device=device,
         )
@@ -420,6 +500,12 @@ def main() -> int:
         action="store_true",
         help="Write only audio_path, text, and emotion fields per line",
     )
+    parser.add_argument(
+        "--min-prob",
+        type=float,
+        default=0.05,
+        help="Only keep emotion probabilities >= this value (default: 0.05)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -429,6 +515,9 @@ def main() -> int:
 
     if not args.manifest.exists():
         logger.error("Manifest not found: %s", args.manifest)
+        return 1
+    if args.min_prob < 0.0 or args.min_prob > 1.0:
+        logger.error("--min-prob must be between 0.0 and 1.0")
         return 1
 
     device = args.device
@@ -455,18 +544,44 @@ def main() -> int:
         local_files_only=args.local_files_only,
     ).to(device)
     model.eval()
+    round_digits = None if args.round < 0 else args.round
 
     output_path = args.output
     if output_path is None:
         output_path = args.manifest.with_suffix(".emotion.jsonl")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    base_dir = args.manifest.parent.resolve()
+    processed_audio_keys = _load_processed_audio_keys(output_path, base_dir)
     if output_path.exists():
-        current_lines = sum(1 for _ in output_path.open("r", encoding="utf-8"))
         logger.info(
-            "Output file already exists: %s (%d lines)", output_path, current_lines
+            "Output file already exists: %s (%d processed audio paths)",
+            output_path,
+            len(processed_audio_keys),
         )
     else:
-        current_lines = 0
         logger.info("Output file will be created: %s", output_path)
+
+    config_path = _write_run_config(
+        output_path,
+        {
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "tool": "ser",
+            "manifest": str(args.manifest.resolve()),
+            "output_jsonl": str(output_path.resolve()),
+            "repo": args.repo,
+            "sample_rate": args.sample_rate,
+            "frame_seconds": args.frame_seconds,
+            "frame_hop": args.frame_hop,
+            "context_seconds": args.context_seconds,
+            "min_seconds": args.min_seconds,
+            "batch_size": args.batch_size,
+            "round_digits": round_digits,
+            "min_prob": args.min_prob,
+            "device": device,
+            "labels": EMO_LABELS,
+        },
+    )
+    logger.info("Run config written to %s", config_path)
 
     audio_cache: Dict[Path, Tuple[np.ndarray, int]] = {}
     total_lines = sum(1 for _ in args.manifest.open("r", encoding="utf-8"))
@@ -475,8 +590,6 @@ def main() -> int:
         open(output_path, "a", encoding="utf-8") as outfile,
     ):
         for line_num, line in enumerate(tqdm(infile, total=total_lines), start=1):
-            if line_num <= current_lines:
-                continue
             stripped = line.strip()
             if not stripped:
                 continue
@@ -486,30 +599,25 @@ def main() -> int:
                 logger.warning("Skipping line %d: JSON decode error: %s", line_num, exc)
                 continue
 
-            entry.setdefault(
-                "emotion_tagging",
-                {
-                    "repo": args.repo,
-                    "sample_rate": args.sample_rate,
-                    "frame_seconds": args.frame_seconds,
-                    "frame_hop": args.frame_hop,
-                    "context_seconds": args.context_seconds,
-                    "labels": EMO_LABELS,
-                },
-            )
+            entry_audio_keys = _collect_audio_keys(entry, base_dir)
+            if entry_audio_keys and all(
+                key in processed_audio_keys for key in entry_audio_keys
+            ):
+                continue
 
             tagged = _tag_entry(
                 entry,
                 model,
                 processor,
-                base_dir=args.manifest.parent,
+                base_dir=base_dir,
                 sample_rate=args.sample_rate,
                 batch_size=args.batch_size,
                 min_seconds=args.min_seconds,
-                round_digits=args.round,
+                round_digits=round_digits,
                 frame_seconds=args.frame_seconds,
                 hop_seconds=args.frame_hop,
                 context_seconds=args.context_seconds,
+                min_prob=args.min_prob,
                 cache_audio=not args.no_cache,
                 audio_cache=audio_cache,
                 device=device,
@@ -520,6 +628,7 @@ def main() -> int:
                     outfile.write(json.dumps(slim, ensure_ascii=False) + "\n")
             else:
                 outfile.write(json.dumps(tagged, ensure_ascii=False) + "\n")
+            processed_audio_keys.update(entry_audio_keys)
 
     logger.info("Emotion-tagged manifest written to %s", output_path)
     return 0

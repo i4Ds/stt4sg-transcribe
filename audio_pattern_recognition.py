@@ -8,6 +8,7 @@ No event extraction and no threshold-based laughter logic.
 import argparse
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -81,10 +82,13 @@ TARGET_LABELS = _dedupe_keep_order(
 )
 
 
-def _round_probs(probs: Dict[str, float], digits: Optional[int]) -> Dict[str, float]:
+def _round_probs(
+    probs: Dict[str, float], digits: Optional[int], min_prob: float
+) -> Dict[str, float]:
+    filtered = {k: float(v) for k, v in probs.items() if float(v) >= min_prob}
     if digits is None:
-        return probs
-    return {k: round(v, digits) for k, v in probs.items()}
+        return filtered
+    return {k: round(v, digits) for k, v in filtered.items()}
 
 
 def _find_audio_path(entry: Dict, segment: Optional[Dict]) -> Optional[Path]:
@@ -110,6 +114,76 @@ def _find_audio_path(entry: Dict, segment: Optional[Dict]) -> Optional[Path]:
         if value:
             return Path(value)
     return None
+
+
+def _resolve_audio_path(
+    entry: Dict,
+    segment: Optional[Dict],
+    base_dir: Path,
+) -> Optional[Path]:
+    audio_path = _find_audio_path(entry, segment)
+    if audio_path is None:
+        return None
+    if not audio_path.is_absolute():
+        audio_path = (base_dir / audio_path).resolve()
+    else:
+        audio_path = audio_path.resolve()
+    return audio_path
+
+
+def _collect_audio_keys(entry: Dict, base_dir: Path) -> List[str]:
+    keys: List[str] = []
+    seen = set()
+    segments: Optional[List[Dict]] = None
+    if isinstance(entry.get("final_segments"), list):
+        segments = entry["final_segments"]
+    elif isinstance(entry.get("segments"), list):
+        segments = entry["segments"]
+    if segments is None:
+        segments = [entry]
+
+    for segment in segments:
+        resolved = _resolve_audio_path(entry, segment, base_dir)
+        if resolved is None:
+            continue
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+    return keys
+
+
+def _load_processed_audio_keys(output_path: Path, base_dir: Path) -> set[str]:
+    processed: set[str] = set()
+    if not output_path.exists():
+        return processed
+
+    with open(output_path, "r", encoding="utf-8") as infile:
+        for line_num, line in enumerate(infile, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                entry = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                logger.warning(
+                    "Ignoring output line %d: JSON decode error: %s", line_num, exc
+                )
+                continue
+            for key in _collect_audio_keys(entry, base_dir):
+                processed.add(key)
+    return processed
+
+
+def _write_run_config(output_path: Path, config: Dict[str, object]) -> Path:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    config_path = output_path.with_name(f"{output_path.stem}.config.{ts}.json")
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(config_path, "w", encoding="utf-8") as cfg:
+        json.dump(config, cfg, ensure_ascii=False, indent=2)
+        cfg.write("\n")
+    return config_path
 
 
 def _load_audio(
@@ -253,6 +327,7 @@ def _tag_audio(
     device: str,
     save_raw_frames: bool,
     raw_top_k: int,
+    min_prob: float,
     segment_start: float = 0.0,
 ) -> Dict[str, object]:
     frames = _predict_framewise(
@@ -271,7 +346,7 @@ def _tag_audio(
         result: Dict[str, object] = {
             "audio_tags_source": "framewise_max",
             "audio_tags": _round_probs(
-                {label: 0.0 for label in label_names}, round_digits
+                {label: 0.0 for label in label_names}, round_digits, min_prob
             ),
             "audio_tag_frames": [],
         }
@@ -291,38 +366,43 @@ def _tag_audio(
         frame_tags = {
             label: float(probs[idx]) for label, idx in zip(label_names, label_indices)
         }
-        best_idx = int(np.argmax(probs))
-        frame_entries.append(
-            {
-                "start": segment_start + t0,
-                "end": segment_start + t1,
-                "top_label": model.config.id2label[best_idx],
-                "audio_tags": _round_probs(frame_tags, round_digits),
-            }
-        )
+        filtered_frame_tags = _round_probs(frame_tags, round_digits, min_prob)
+        if filtered_frame_tags:
+            best_idx = int(np.argmax(probs))
+            frame_entries.append(
+                {
+                    "start": segment_start + t0,
+                    "end": segment_start + t1,
+                    "top_label": model.config.id2label[best_idx],
+                    "audio_tags": filtered_frame_tags,
+                }
+            )
 
         if save_raw_frames:
             top_idx = np.argsort(-probs)[: max(raw_top_k, 1)]
             top_labels = [
                 {"label": model.config.id2label[int(i)], "score": float(probs[int(i)])}
                 for i in top_idx
+                if float(probs[int(i)]) >= min_prob
             ]
             if round_digits is not None:
                 for item in top_labels:
                     item["score"] = round(item["score"], round_digits)
-            raw_entries.append(
-                {
-                    "start": segment_start + t0,
-                    "end": segment_start + t1,
-                    "top_labels": top_labels,
-                }
-            )
+            if top_labels:
+                raw_entries.append(
+                    {
+                        "start": segment_start + t0,
+                        "end": segment_start + t1,
+                        "top_labels": top_labels,
+                    }
+                )
 
     result = {
         "audio_tags_source": "framewise_max",
         "audio_tags": _round_probs(
             {label: float(value) for label, value in zip(label_names, max_probs)},
             round_digits,
+            min_prob,
         ),
         "audio_tag_frames": frame_entries,
     }
@@ -348,6 +428,7 @@ def _tag_entry(
     round_digits: Optional[int],
     save_raw_frames: bool,
     raw_top_k: int,
+    min_prob: float,
     cache_audio: bool,
     audio_cache: Dict[Path, Tuple[np.ndarray, int]],
     device: str,
@@ -365,13 +446,11 @@ def _tag_entry(
         segments = [entry]
 
     for segment in segments:
-        audio_path = _find_audio_path(entry, segment)
+        audio_path = _resolve_audio_path(entry, segment, base_dir)
         if audio_path is None:
             logger.warning("No audio path found for entry; skipping tagging.")
             continue
 
-        if not audio_path.is_absolute():
-            audio_path = (base_dir / audio_path).resolve()
         if not audio_path.exists():
             logger.warning("Audio file not found: %s", audio_path)
             continue
@@ -395,6 +474,7 @@ def _tag_entry(
                 device=device,
                 save_raw_frames=save_raw_frames,
                 raw_top_k=raw_top_k,
+                min_prob=min_prob,
                 segment_start=0.0,
             )
         )
@@ -434,6 +514,12 @@ def main() -> int:
     parser.add_argument("--raw-top-k", type=int, default=10)
     parser.add_argument("--minimal-output", action="store_true")
     parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument(
+        "--min-prob",
+        type=float,
+        default=0.05,
+        help="Only keep tag probabilities >= this value (default: 0.05)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -446,6 +532,9 @@ def main() -> int:
         return 1
     if args.frame_seconds <= 0 or args.frame_hop <= 0 or args.context_seconds <= 0:
         logger.error("--frame-seconds, --frame-hop and --context-seconds must be > 0")
+        return 1
+    if args.min_prob < 0.0 or args.min_prob > 1.0:
+        logger.error("--min-prob must be between 0.0 and 1.0")
         return 1
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -464,22 +553,48 @@ def main() -> int:
 
     round_digits = None if args.round < 0 else args.round
     output_path = args.output or args.manifest.with_suffix(".tagged.jsonl")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    base_dir = args.manifest.parent.resolve()
+    processed_audio_keys = _load_processed_audio_keys(output_path, base_dir)
+    if output_path.exists():
+        logger.info(
+            "Output file already exists: %s (%d processed audio paths)",
+            output_path,
+            len(processed_audio_keys),
+        )
+    else:
+        logger.info("Output file will be created: %s", output_path)
+
+    config_path = _write_run_config(
+        output_path,
+        {
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "tool": "audio_pattern_recognition",
+            "manifest": str(args.manifest.resolve()),
+            "output_jsonl": str(output_path.resolve()),
+            "model_id": args.model_id,
+            "sample_rate": args.sample_rate,
+            "frame_seconds": args.frame_seconds,
+            "frame_hop": args.frame_hop,
+            "context_seconds": args.context_seconds,
+            "batch_size": args.batch_size,
+            "round_digits": round_digits,
+            "min_prob": args.min_prob,
+            "device": device,
+            "target_labels": label_names,
+        },
+    )
+    logger.info("Run config written to %s", config_path)
+
     audio_cache: Dict[Path, Tuple[np.ndarray, int]] = {}
 
-    with open(output_path, "w", encoding="utf-8") as outfile:
+    with open(output_path, "a", encoding="utf-8") as outfile:
         for _, entry in _iter_jsonl(args.manifest):
-            entry.setdefault(
-                "audio_tagging",
-                {
-                    "model_id": args.model_id,
-                    "mode": "framewise_ast",
-                    "sample_rate": args.sample_rate,
-                    "frame_seconds": args.frame_seconds,
-                    "frame_hop": args.frame_hop,
-                    "context_seconds": args.context_seconds,
-                    "labels": label_names,
-                },
-            )
+            entry_audio_keys = _collect_audio_keys(entry, base_dir)
+            if entry_audio_keys and all(
+                key in processed_audio_keys for key in entry_audio_keys
+            ):
+                continue
 
             tagged = _tag_entry(
                 entry=entry,
@@ -487,7 +602,7 @@ def main() -> int:
                 feature_extractor=feature_extractor,
                 label_indices=label_indices,
                 label_names=label_names,
-                base_dir=args.manifest.parent,
+                base_dir=base_dir,
                 sample_rate=args.sample_rate,
                 frame_seconds=args.frame_seconds,
                 frame_hop=args.frame_hop,
@@ -496,6 +611,7 @@ def main() -> int:
                 round_digits=round_digits,
                 save_raw_frames=args.save_raw_frames,
                 raw_top_k=args.raw_top_k,
+                min_prob=args.min_prob,
                 cache_audio=not args.no_cache,
                 audio_cache=audio_cache,
                 device=device,
@@ -508,7 +624,6 @@ def main() -> int:
                     or tagged.get("path")
                     or tagged.get("audio"),
                     "text": tagged.get("text"),
-                    "audio_tagging": tagged.get("audio_tagging"),
                     "audio_tags_source": tagged.get("audio_tags_source"),
                     "audio_tags": tagged.get("audio_tags"),
                     "audio_tag_frames": tagged.get("audio_tag_frames"),
@@ -518,6 +633,7 @@ def main() -> int:
                 outfile.write(json.dumps(slim, ensure_ascii=False) + "\n")
             else:
                 outfile.write(json.dumps(tagged, ensure_ascii=False) + "\n")
+            processed_audio_keys.update(entry_audio_keys)
 
     logger.info("Tagged manifest written to %s", output_path)
     return 0

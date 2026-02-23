@@ -28,6 +28,7 @@ import numpy as np
 from pydub import AudioSegment
 
 logger = logging.getLogger("extract_segments")
+_RESUME_AUDIO_KEYS: Optional[set[str]] = None
 
 
 @dataclass
@@ -122,6 +123,52 @@ def iter_json_files(root: Path) -> Iterable[Path]:
     for path in root.rglob("*.json"):
         if path.is_file():
             yield path
+
+
+def _normalize_audio_key(path_value: str) -> str:
+    """Normalize audio_path values for robust dedupe checks."""
+    if not path_value:
+        return ""
+    if path_value.startswith("<dry-run>/"):
+        return path_value
+    try:
+        return str(Path(path_value).resolve())
+    except Exception:
+        return path_value
+
+
+def _load_processed_audio_keys(manifest_path: Path) -> set[str]:
+    """Load already written audio paths from an existing manifest."""
+    processed: set[str] = set()
+    if not manifest_path.exists():
+        return processed
+
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                entry = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                logger.warning(
+                    "Ignoring manifest line %d during resume: JSON decode error: %s",
+                    line_num,
+                    exc,
+                )
+                continue
+            audio_path = entry.get("audio_path")
+            if isinstance(audio_path, str):
+                key = _normalize_audio_key(audio_path)
+                if key:
+                    processed.add(key)
+    return processed
+
+
+def _init_resume_audio_keys(keys: set[str]) -> None:
+    """Initializer for process workers."""
+    global _RESUME_AUDIO_KEYS
+    _RESUME_AUDIO_KEYS = keys
 
 
 def load_segments_from_json(json_path: Path) -> tuple[str, List[Dict]]:
@@ -524,6 +571,7 @@ def process_json_file(
     audio_format: str = "flac",
     dry_run: bool = False,
     frame_ms: int = 10,
+    processed_audio_keys: Optional[set[str]] = None,
 ) -> tuple[List[Dict], List[Dict], Dict]:
     """
     Process a single JSON file and extract segments.
@@ -647,15 +695,6 @@ def process_json_file(
     if not final:
         return [], rejected, input_stats
 
-    # Load audio once for all segments
-    audio = None
-    if not dry_run:
-        try:
-            audio = AudioSegment.from_file(audio_file)
-        except Exception as e:
-            logger.error(f"Failed to load audio {audio_file}: {e}")
-            return [], rejected, input_stats
-
     # Create output subdirectory preserving folder structure
     # e.g., input: srf/Trüffelschweine/ep1.mp3 -> output: processed/audio/Trüffelschweine/ep1/
     source_stem = Path(audio_file).stem
@@ -672,14 +711,42 @@ def process_json_file(
     # Sort final segments by start time for proper cutting
     final = sorted(final, key=lambda s: s.get("start", 0))
 
-    # Process each segment
-    results = []
-    for i, seg in enumerate(final):
-        # Generate output filename
+    # Resolve resume keys (worker-local in multiprocessing mode).
+    if processed_audio_keys is None:
+        processed_audio_keys = _RESUME_AUDIO_KEYS or set()
+
+    pending: List[tuple[Dict, Path]] = []
+    for seg in final:
         start_str = f"{seg['start']:.2f}".replace(".", "_")
         end_str = f"{seg['end']:.2f}".replace(".", "_")
         segment_filename = f"{source_stem}_{start_str}-{end_str}.{audio_format}"
         segment_path = segment_dir / segment_filename
+        key = _normalize_audio_key(str(segment_path))
+        if key and key in processed_audio_keys:
+            continue
+        pending.append((seg, segment_path))
+
+    if not pending:
+        logger.info(
+            "Skipping %s: all %d candidate segments already in manifest",
+            json_path,
+            len(final),
+        )
+        return [], [], input_stats
+
+    # Load audio once for pending segments
+    audio = None
+    if not dry_run:
+        try:
+            audio = AudioSegment.from_file(audio_file)
+        except Exception as e:
+            logger.error(f"Failed to load audio {audio_file}: {e}")
+            return [], rejected, input_stats
+
+    # Process each pending segment
+    results = []
+    for seg, segment_path in pending:
+        segment_filename = segment_path.name
 
         # Use segment end directly; boundary rounding already adds minimal safety.
         cut_end = seg["end"]
@@ -736,7 +803,9 @@ def process_json_file(
         # Add output path to dict for JSONL - audio_path as FIRST key
         info_dict = info.to_dict()
         audio_path_value = (
-            str(segment_path) if not dry_run else f"<dry-run>/{segment_filename}"
+            str(segment_path.resolve())
+            if not dry_run
+            else f"<dry-run>/{segment_filename}"
         )
         # Create new dict with audio_path first, then text, then rest
         ordered_dict = {"audio_path": audio_path_value}
@@ -913,7 +982,14 @@ def main():
 
     jsonl_path = output_dir / "manifest.jsonl"
     rejected_path = output_dir / "rejected.jsonl"
-    logger.info(f"Writing manifest incrementally to {jsonl_path}")
+    processed_audio_keys = _load_processed_audio_keys(jsonl_path)
+    manifest_mode = "a" if jsonl_path.exists() else "w"
+    logger.info(
+        "Writing manifest incrementally to %s (%s mode, %d existing audio paths)",
+        jsonl_path,
+        "append" if manifest_mode == "a" else "write",
+        len(processed_audio_keys),
+    )
     logger.info(f"Writing rejected segments incrementally to {rejected_path}")
 
     max_workers = int(args.workers)
@@ -922,7 +998,7 @@ def main():
     else:
         logger.info("Parallel processing disabled (workers=1)")
 
-    with open(jsonl_path, "w", encoding="utf-8") as manifest_f, open(
+    with open(jsonl_path, manifest_mode, encoding="utf-8") as manifest_f, open(
         rejected_path, "w", encoding="utf-8"
     ) as rejected_f:
         def persist_and_update(
@@ -930,6 +1006,9 @@ def main():
         ) -> None:
             for seg in segments:
                 manifest_f.write(json.dumps(seg, ensure_ascii=False) + "\n")
+                audio_key = _normalize_audio_key(str(seg.get("audio_path", "")))
+                if audio_key:
+                    processed_audio_keys.add(audio_key)
             for rej in rejected:
                 rejected_f.write(json.dumps(rej, ensure_ascii=False) + "\n")
             manifest_f.flush()
@@ -964,6 +1043,7 @@ def main():
                         args.audio_format,
                         args.dry_run,
                         frame_ms=args.frame_ms,
+                        processed_audio_keys=processed_audio_keys,
                     )
                 except Exception as e:
                     logger.exception(f"Error processing {json_path}: {e}")
@@ -973,7 +1053,9 @@ def main():
         else:
             future_to_path = {}
             with concurrent.futures.ProcessPoolExecutor(
-                max_workers=max_workers
+                max_workers=max_workers,
+                initializer=_init_resume_audio_keys,
+                initargs=(processed_audio_keys,),
             ) as executor:
                 for json_path in json_files:
                     future = executor.submit(
