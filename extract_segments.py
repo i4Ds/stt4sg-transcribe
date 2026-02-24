@@ -437,15 +437,17 @@ def cut_audio_segment(
     start: float,
     end: float,
     output_path: Path,
-    format: str = "flac",
-    frame_ms: int = 10,
+    format: str,
+    frame_ms: int,
+    cut_pad_start_ms: int,
+    cut_pad_end_ms: int,
 ) -> tuple[bool, Optional[AudioSegment]]:
     """
     Cut a segment from audio and save to file.
 
     Uses floor for start and ceil for end, rounding to frame boundaries.
-    Silero VAD timestamps are at 10ms resolution, so we round
-    END up to the nearest frame boundary to avoid cutting off audio.
+    Applies explicit asymmetric padding before rounding so trailing speech
+    is less likely to be cut off.
 
     Args:
         audio: Source audio
@@ -453,14 +455,16 @@ def cut_audio_segment(
         end: End time in seconds
         output_path: Where to save the segment
         format: Output format (flac, wav, mp3)
-        frame_ms: Frame size in ms for rounding (default: 10 for Silero)
+        frame_ms: Frame size in ms for rounding
+        cut_pad_start_ms: Extra padding (ms) added before start
+        cut_pad_end_ms: Extra padding (ms) added after end
     """
     import math
 
     try:
         # Convert to ms
-        start_ms = start * 1000
-        end_ms = end * 1000
+        start_ms = start * 1000 - cut_pad_start_ms
+        end_ms = end * 1000 + cut_pad_end_ms
 
         # Round START down to nearest frame boundary
         start_ms = int(math.floor(start_ms / frame_ms) * frame_ms)
@@ -568,9 +572,11 @@ def process_json_file(
     config: FilterConfig,
     output_dir: Path,
     input_root: Path,
-    audio_format: str = "flac",
-    dry_run: bool = False,
-    frame_ms: int = 10,
+    audio_format: str,
+    dry_run: bool,
+    frame_ms: int,
+    cut_pad_start_ms: int,
+    cut_pad_end_ms: int,
     processed_audio_keys: Optional[set[str]] = None,
 ) -> tuple[List[Dict], List[Dict], Dict]:
     """
@@ -584,6 +590,8 @@ def process_json_file(
         audio_format: Output audio format
         dry_run: If True, don't actually cut audio
         frame_ms: Frame size for rounding timestamps
+        cut_pad_start_ms: Extra padding (ms) before segment start
+        cut_pad_end_ms: Extra padding (ms) after segment end
 
     Returns:
         (accepted_segments, rejected_segments, input_stats) where input_stats contains:
@@ -748,19 +756,18 @@ def process_json_file(
     for seg, segment_path in pending:
         segment_filename = segment_path.name
 
-        # Use segment end directly; boundary rounding already adds minimal safety.
-        cut_end = seg["end"]
-
-        # Cut audio with frame-aligned boundaries (Silero uses 10ms frames)
+        # Cut audio with frame-aligned boundaries (Silero uses 32ms frames)
         segment_metrics = None
         if not dry_run and audio:
             success, cut_segment = cut_audio_segment(
                 audio,
-                seg["start"],
-                cut_end,
-                segment_path,
-                audio_format,
+                start=seg["start"],
+                end=seg["end"],
+                output_path=segment_path,
+                format=audio_format,
                 frame_ms=frame_ms,
+                cut_pad_start_ms=cut_pad_start_ms,
+                cut_pad_end_ms=cut_pad_end_ms,
             )
             if not success:
                 continue
@@ -898,8 +905,20 @@ def main():
     parser.add_argument(
         "--frame-ms",
         type=int,
-        default=10,
-        help="Frame size in ms for rounding timestamps (Silero uses 10ms)",
+        default=32,
+        help="Frame size in ms for rounding timestamps (Silero uses 32ms)",
+    )
+    parser.add_argument(
+        "--cut-pad-start-ms",
+        type=int,
+        default=25,
+        help="Extra padding in ms before each cut segment start",
+    )
+    parser.add_argument(
+        "--cut-pad-end-ms",
+        type=int,
+        default=200,
+        help="Extra padding in ms after each cut segment end",
     )
     parser.add_argument(
         "--limit", type=int, help="Limit number of JSON files to process"
@@ -998,9 +1017,11 @@ def main():
     else:
         logger.info("Parallel processing disabled (workers=1)")
 
-    with open(jsonl_path, manifest_mode, encoding="utf-8") as manifest_f, open(
-        rejected_path, "w", encoding="utf-8"
-    ) as rejected_f:
+    with (
+        open(jsonl_path, manifest_mode, encoding="utf-8") as manifest_f,
+        open(rejected_path, "w", encoding="utf-8") as rejected_f,
+    ):
+
         def persist_and_update(
             segments: List[Dict], rejected: List[Dict], input_stats: Dict[str, Any]
         ) -> None:
@@ -1052,6 +1073,8 @@ def main():
                         args.audio_format,
                         args.dry_run,
                         frame_ms=args.frame_ms,
+                        cut_pad_start_ms=args.cut_pad_start_ms,
+                        cut_pad_end_ms=args.cut_pad_end_ms,
                         processed_audio_keys=processed_audio_keys,
                     )
                 except Exception as e:
@@ -1076,6 +1099,8 @@ def main():
                         args.audio_format,
                         args.dry_run,
                         args.frame_ms,
+                        args.cut_pad_start_ms,
+                        args.cut_pad_end_ms,
                     )
                     future_to_path[future] = json_path
 

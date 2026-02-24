@@ -13,9 +13,12 @@ python extract_segments.py /mnt/nas05/data02/vincenzo/podcast_data/youtube \
     --output-dir /mnt/nas05/data02/vincenzo/podcast_data/youtube/processed \
     --min-purity 0.99 \
     --min-coverage 0.9 \
-    --min-duration 3.0 \
-    --max-duration 30.0 \
+    --min-duration 5.0 \
+    --max-duration 15.0 \
     --min-avg-logprob -0.5 \
+    --frame-ms 10 \
+    --cut-pad-start-ms 25 \
+    --cut-pad-end-ms 200 \
     --no-summary \
     --max-pause 3 \
     --max-non-main-time 0.2
