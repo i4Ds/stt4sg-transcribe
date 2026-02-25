@@ -3,10 +3,9 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --job-name ser_youtube
 #SBATCH --mem=32G
-#SBATCH --gres=gpu:1
-#SBATCH --partition=performance
+#SBATCH --gres=gpu:rtx3080
+#SBATCH --partition=top6
 #SBATCH --nodes=1
-#SBATCH --nodelist=calc-g-002,calc-g-004,calc-g-006
 #SBATCH --out=logs/ser_youtube_%j.out
 #SBATCH --error=logs/ser_youtube_%j.err
 
