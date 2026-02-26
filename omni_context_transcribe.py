@@ -8,6 +8,7 @@ import json
 import logging
 import random
 import re
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,37 @@ from typing import Any, Dict, Iterable, List, Optional
 import pyarrow.compute as pc
 
 LOGGER = logging.getLogger("omni_context_transcribe")
+
+
+DIALECT_NAME_ALIASES: Dict[str, str] = {
+    # Swissdial client_id codes
+    "be": "be",
+    "bs": "bs",
+    "zh": "zh",
+    "lu": "lu",
+    "sg": "sg",
+    "ag": "ag",
+    "gr": "gr",
+    "vs": "vs",
+    # Spoken-dialect names in manifest_with_speaker_dialect.jsonl
+    "bern": "be",
+    "basel": "bs",
+    "zurich": "zh",
+    "zürich": "zh",
+    "innerschweiz": "lu",
+    "zentralschweiz": "lu",
+    "ostschweiz": "sg",
+    "aargau": "ag",
+    "graubunden": "gr",
+    "graubünden": "gr",
+    "wallis": "vs",
+    # Non-swissdial language labels; these do not match Swissdial dialect pools.
+    "deutsch": "de",
+    "hochdeutsch": "de",
+    "englisch": "en",
+    "französisch": "fr",
+    "italienisch": "it",
+}
 
 
 @dataclass
@@ -32,6 +64,7 @@ class ContextRef:
     row_idx: int
     dialect: str
     text: str
+    filter_text: str
     audio_path: Optional[str]
 
 
@@ -60,7 +93,14 @@ def _normalize_dialect(value: Any, aliases: Dict[str, str]) -> Optional[str]:
     if not text:
         return None
     lowered = text.lower()
-    return aliases.get(lowered, lowered)
+    normalized_ascii = (
+        unicodedata.normalize("NFKD", lowered).encode("ascii", "ignore").decode("ascii")
+    )
+    if lowered in aliases:
+        return aliases[lowered]
+    if normalized_ascii in aliases:
+        return aliases[normalized_ascii]
+    return lowered
 
 
 def _resolve_path(raw_path: str, base_dir: Path) -> str:
@@ -131,10 +171,11 @@ def _build_context_index(
     splits: List[str],
     dialect_fields: List[str],
     text_fields: List[str],
+    filter_text_fields: List[str],
     audio_field: str,
     aliases: Dict[str, str],
     context_text_regex: Optional[str] = None,
-) -> tuple[Any, Dict[str, List[ContextRef]], str, str]:
+) -> tuple[Any, Dict[str, List[ContextRef]], str, str, str]:
     try:
         from datasets import load_from_disk
     except ImportError as exc:
@@ -147,12 +188,15 @@ def _build_context_index(
     index: Dict[str, List[ContextRef]] = defaultdict(list)
     chosen_dialect_field: Optional[str] = None
     chosen_text_field: Optional[str] = None
+    chosen_filter_text_field: Optional[str] = None
 
     text_pattern = re.compile(context_text_regex) if context_text_regex else None
 
     for split in splits:
         if split not in dataset_dict:
-            raise ValueError(f"Split '{split}' not found in dataset. Available: {list(dataset_dict.keys())}")
+            raise ValueError(
+                f"Split '{split}' not found in dataset. Available: {list(dataset_dict.keys())}"
+            )
 
         ds_split = dataset_dict[split]
         column_names = set(ds_split.column_names)
@@ -168,6 +212,9 @@ def _build_context_index(
             raise ValueError(
                 f"Could not find context text field in split '{split}'. Tried: {text_fields}. Found: {ds_split.column_names}"
             )
+        filter_text_field = next((x for x in filter_text_fields if x in column_names), None)
+        if filter_text_field is None:
+            filter_text_field = text_field
 
         if audio_field not in column_names:
             raise ValueError(
@@ -176,10 +223,12 @@ def _build_context_index(
 
         chosen_dialect_field = chosen_dialect_field or dialect_field
         chosen_text_field = chosen_text_field or text_field
+        chosen_filter_text_field = chosen_filter_text_field or filter_text_field
 
         table = ds_split._data.table
         dialect_col = table[dialect_field]
         text_col = table[text_field]
+        filter_text_col = table[filter_text_field]
 
         # Access nested audio.path without materializing waveform arrays.
         path_col = None
@@ -198,7 +247,13 @@ def _build_context_index(
             text = str(text).strip()
             if not text:
                 continue
-            if text_pattern and not text_pattern.search(text):
+            filter_text = filter_text_col[i].as_py()
+            if filter_text is None:
+                continue
+            filter_text = str(filter_text).strip()
+            if not filter_text:
+                continue
+            if text_pattern and not text_pattern.search(filter_text):
                 continue
             audio_path = None
             if path_col is not None:
@@ -209,14 +264,25 @@ def _build_context_index(
                     row_idx=i,
                     dialect=dialect,
                     text=text,
+                    filter_text=filter_text,
                     audio_path=audio_path,
                 )
             )
 
-    if chosen_dialect_field is None or chosen_text_field is None:
+    if (
+        chosen_dialect_field is None
+        or chosen_text_field is None
+        or chosen_filter_text_field is None
+    ):
         raise RuntimeError("No valid splits were indexed.")
 
-    return dataset_dict, index, chosen_dialect_field, chosen_text_field
+    return (
+        dataset_dict,
+        index,
+        chosen_dialect_field,
+        chosen_text_field,
+        chosen_filter_text_field,
+    )
 
 
 def _resolve_hf_audio_path(
@@ -319,9 +385,51 @@ def _read_resume_lines(output_path: Path) -> set[int]:
     return done
 
 
-def _chunked(items: List[ManifestRecord], batch_size: int) -> Iterable[List[ManifestRecord]]:
+def _chunked(
+    items: List[ManifestRecord], batch_size: int
+) -> Iterable[List[ManifestRecord]]:
     for i in range(0, len(items), batch_size):
         yield items[i : i + batch_size]
+
+
+def _sample_context_refs(
+    rng: random.Random,
+    pool: List[ContextRef],
+    number_pool: List[ContextRef],
+    context_size: int,
+    number_ratio: float,
+    previous_keys: Optional[set[tuple[str, int]]] = None,
+) -> List[ContextRef]:
+    k = min(context_size, len(pool))
+    if k <= 0:
+        return []
+
+    effective_ratio = min(max(number_ratio, 0.0), 1.0)
+    target_num = min(int(round(k * effective_ratio)), len(number_pool), k)
+    if effective_ratio > 0.0 and target_num == 0 and number_pool:
+        target_num = 1
+
+    selected: List[ContextRef] = []
+    for attempt in range(4):
+        selected.clear()
+        selected_keys: set[tuple[str, int]] = set()
+
+        if target_num > 0:
+            nums = rng.sample(number_pool, k=target_num)
+            selected.extend(nums)
+            selected_keys.update((x.split, x.row_idx) for x in nums)
+
+        remaining = k - len(selected)
+        if remaining > 0:
+            candidates = [x for x in pool if (x.split, x.row_idx) not in selected_keys]
+            selected.extend(rng.sample(candidates, k=remaining))
+
+        rng.shuffle(selected)
+        current_keys = {(x.split, x.row_idx) for x in selected}
+        if previous_keys is None or current_keys != previous_keys or len(pool) <= k:
+            break
+
+    return list(selected)
 
 
 def main() -> None:
@@ -370,7 +478,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--manifest-dialect-fields",
-        default="dialect,dialect_tag,client_id",
+        default="dialect_speaker_majority_name,dialect_speaker_majority,dialect_segment_name,dialect_segment,dialect,dialect_tag,client_id",
         help="Comma-separated candidate dialect fields in manifest",
     )
     parser.add_argument(
@@ -400,8 +508,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--hf-text-fields",
-        default="sentence_ch,text,sentence,transcript",
-        help="Comma-separated candidate transcript fields in HF dataset (for context text)",
+        default="sentence_ch,sentence_de,text,sentence,transcript",
+        help="Comma-separated candidate transcript fields in HF dataset used as context text passed to Omni",
+    )
+    parser.add_argument(
+        "--hf-filter-text-fields",
+        default="sentence_de,sentence_ch,text,sentence,transcript",
+        help="Comma-separated candidate transcript fields used for context filtering/number detection",
     )
     parser.add_argument(
         "--context-text-regex",
@@ -410,7 +523,13 @@ def main() -> None:
     parser.add_argument(
         "--context-number-like",
         action="store_true",
-        help="Use only number-like HF context texts (digits or common number words)",
+        help="Prefer number-like HF context texts. If --context-number-ratio is not set, this implies ratio=1.0",
+    )
+    parser.add_argument(
+        "--context-number-ratio",
+        type=float,
+        default=0.0,
+        help="Target fraction of context examples per batch that should be number-like (0.0..1.0)",
     )
     parser.add_argument(
         "--hf-audio-field",
@@ -445,6 +564,11 @@ def main() -> None:
         help="Process at most this many manifest rows after filtering/resume",
     )
     parser.add_argument(
+        "--save-context-in-output",
+        action="store_true",
+        help="Save the sampled in-context examples (dialect/text) into each output row",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Do all indexing/sampling/batching but skip model inference",
@@ -452,6 +576,7 @@ def main() -> None:
     parser.add_argument("--log-level", default="INFO")
 
     args = parser.parse_args()
+    save_context_in_output = args.save_context_in_output or (args.limit is not None)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
@@ -475,32 +600,39 @@ def main() -> None:
         else manifest_path.with_suffix(".omni.jsonl")
     )
 
-    aliases = _parse_aliases(args.dialect_aliases)
+    aliases = dict(DIALECT_NAME_ALIASES)
+    aliases.update(_parse_aliases(args.dialect_aliases))
     manifest_audio_fields = _split_csv(args.manifest_audio_fields)
     manifest_dialect_fields = _split_csv(args.manifest_dialect_fields)
 
     hf_splits = _split_csv(args.hf_splits)
     hf_dialect_fields = _split_csv(args.hf_dialect_fields)
     hf_text_fields = _split_csv(args.hf_text_fields)
+    hf_filter_text_fields = _split_csv(args.hf_filter_text_fields)
 
     number_like_regex = (
         r"(?i)(\d|\b(eis|ein|eine|eins|zwei|zwöi|zwo|drü|drei|vier|füf|fünf|"
         r"sechs|sibe|sieben|acht|nün|neun|zäh|zehn|elf|zwölf|hundert|tausend)\b)"
     )
     context_text_regex = args.context_text_regex
-    if args.context_number_like:
-        if context_text_regex:
-            context_text_regex = f"(?:{context_text_regex})|(?:{number_like_regex})"
-        else:
-            context_text_regex = number_like_regex
+    context_number_ratio = args.context_number_ratio
+    if args.context_number_like and context_number_ratio <= 0.0:
+        context_number_ratio = 1.0
+    if context_number_ratio < 0.0 or context_number_ratio > 1.0:
+        raise ValueError("--context-number-ratio must be in [0.0, 1.0]")
+    number_pattern = re.compile(number_like_regex)
 
-    hf_audio_roots = [Path(x).expanduser().resolve() for x in _split_csv(args.hf_audio_roots)]
+    hf_audio_roots = [
+        Path(x).expanduser().resolve() for x in _split_csv(args.hf_audio_roots)
+    ]
     if not hf_audio_roots:
         hf_audio_roots = [hf_dataset_path]
 
     done_lines = _read_resume_lines(output_path) if args.resume else set()
     if done_lines:
-        LOGGER.info("Resume enabled: %d lines already done in %s", len(done_lines), output_path)
+        LOGGER.info(
+            "Resume enabled: %d lines already done in %s", len(done_lines), output_path
+        )
 
     manifest_records = [
         x
@@ -523,11 +655,18 @@ def main() -> None:
 
     rng = random.Random(args.seed)
 
-    dataset_dict, context_index, hf_dialect_col, hf_text_col = _build_context_index(
+    (
+        dataset_dict,
+        context_index,
+        hf_dialect_col,
+        hf_text_col,
+        hf_filter_text_col,
+    ) = _build_context_index(
         hf_dataset_path=hf_dataset_path,
         splits=hf_splits,
         dialect_fields=hf_dialect_fields,
         text_fields=hf_text_fields,
+        filter_text_fields=hf_filter_text_fields,
         audio_field=args.hf_audio_field,
         aliases=aliases,
         context_text_regex=context_text_regex,
@@ -536,6 +675,11 @@ def main() -> None:
     all_context_refs = [x for refs in context_index.values() for x in refs]
     if not all_context_refs:
         raise RuntimeError("No usable context rows found in HF dataset.")
+    number_context_index: Dict[str, List[ContextRef]] = defaultdict(list)
+    for dialect, refs in context_index.items():
+        number_context_index[dialect] = [
+            x for x in refs if number_pattern.search(x.filter_text)
+        ]
 
     grouped_manifest: Dict[str, List[ManifestRecord]] = defaultdict(list)
     for rec in manifest_records:
@@ -544,10 +688,25 @@ def main() -> None:
     dialects = sorted(grouped_manifest.keys())
 
     LOGGER.info("Manifest rows to process: %d", len(manifest_records))
-    LOGGER.info("Dialect groups in manifest: %s", ", ".join(f"{d}:{len(grouped_manifest[d])}" for d in dialects))
+    LOGGER.info(
+        "Dialect groups in manifest: %s",
+        ", ".join(f"{d}:{len(grouped_manifest[d])}" for d in dialects),
+    )
     LOGGER.info("HF context dialect field: %s", hf_dialect_col)
     LOGGER.info("HF context text field: %s", hf_text_col)
-    LOGGER.info("HF context pools: %d dialects, %d rows", len(context_index), len(all_context_refs))
+    LOGGER.info("HF filter text field: %s", hf_filter_text_col)
+    LOGGER.info(
+        "HF context pools: %d dialects, %d rows",
+        len(context_index),
+        len(all_context_refs),
+    )
+    if context_number_ratio > 0.0:
+        total_number_like = sum(len(v) for v in number_context_index.values())
+        LOGGER.info(
+            "Number-like context target ratio: %.2f (%d number-like rows available)",
+            context_number_ratio,
+            total_number_like,
+        )
 
     pipeline = None
     if not args.dry_run:
@@ -562,6 +721,7 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     processed = 0
+    previous_context_keys_by_dialect: Dict[str, set[tuple[str, int]]] = {}
     output_mode = "a" if args.resume else "w"
     with output_path.open(output_mode, encoding="utf-8") as out_f:
         for dialect in dialects:
@@ -582,10 +742,27 @@ def main() -> None:
                     "Dialect '%s' not found in HF context pool. Falling back to global random contexts.",
                     dialect,
                 )
+            number_pool = number_context_index.get(dialect, [])
+            if dialect_pool is all_context_refs:
+                number_pool = [
+                    x for x in all_context_refs if number_pattern.search(x.filter_text)
+                ]
 
             for batch in _chunked(records, args.batch_size):
-                k = min(args.context_size, len(dialect_pool))
-                sampled_refs = rng.sample(dialect_pool, k=k)
+                sampled_refs = _sample_context_refs(
+                    rng=rng,
+                    pool=dialect_pool,
+                    number_pool=number_pool,
+                    context_size=args.context_size,
+                    number_ratio=context_number_ratio,
+                    previous_keys=previous_context_keys_by_dialect.get(dialect),
+                )
+                previous_context_keys_by_dialect[dialect] = {
+                    (x.split, x.row_idx) for x in sampled_refs
+                }
+                number_context_count = sum(
+                    1 for x in sampled_refs if number_pattern.search(x.filter_text)
+                )
 
                 context_examples, context_meta = _build_context_examples(
                     refs=sampled_refs,
@@ -617,17 +794,23 @@ def main() -> None:
                         "text": src_text,
                         "omni_text": transcription,
                     }
+                    if save_context_in_output:
+                        row["context_examples"] = [
+                            {"dialect": m["dialect"], "text": m["text"]}
+                            for m in context_meta
+                        ]
                     out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
                     processed += 1
 
                 out_f.flush()
                 LOGGER.info(
-                    "Processed %d/%d rows (dialect=%s, batch=%d, context=%d)",
+                    "Processed %d/%d rows (dialect=%s, batch=%d, context=%d, number_context=%d)",
                     processed,
                     len(manifest_records),
                     dialect,
                     len(batch),
                     len(context_examples),
+                    number_context_count,
                 )
 
     LOGGER.info("Done. Wrote %d rows to %s", processed, output_path)
