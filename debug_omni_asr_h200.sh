@@ -38,7 +38,7 @@ python -V
 nvidia-smi || true
 
 MANIFEST="/mnt/nas05/data02/vincenzo/podcast_data/youtube/processed/manifest.jsonl"
-HF_DATASET="/home2/vincenzo/stt4sg-transcribe/all"
+HF_DATASET="/home2/vincenzo/stt4sg-transcribe/swissdial_hu"
 
 if [ ! -f "${MANIFEST}" ]; then
     echo "Manifest not found: ${MANIFEST}"
@@ -59,21 +59,22 @@ if missing:
 print("Dependency check ok")
 PY
 
-BATCH_SIZES=(8 16 32 64 96 128 160 192 224 256 320 384 448 512 640 768 896 1024)
+BATCH_SIZES=(8 16 32 64 96 128 160 192 224 256 320 384 448 512 640 768)
 LAST_OK=0
-LIMIT=128
+LIMIT=0
 CONTEXT=10
 
 for BS in "${BATCH_SIZES[@]}"; do
     OUT="/tmp/manifest.omni.debug.bs${BS}.jsonl"
     rm -f "${OUT}"
+    LIMIT=${BS}
 
     echo "============================================================"
     echo "Testing batch size: ${BS}"
     echo "============================================================"
 
     set +e
-    python omni_asr.py "${MANIFEST}" \
+    python omni_context_transcribe.py "${MANIFEST}" \
       --hf-dataset-path "${HF_DATASET}" \
       --model-card omniASR_LLM_7B_ZS \
       --default-dialect ZH \

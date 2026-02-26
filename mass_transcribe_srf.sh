@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --time=24:00:00
+#SBATCH --time=144:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --job-name srf_srt_batch
 #SBATCH --mem=32G

@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import random
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -132,6 +133,7 @@ def _build_context_index(
     text_fields: List[str],
     audio_field: str,
     aliases: Dict[str, str],
+    context_text_regex: Optional[str] = None,
 ) -> tuple[Any, Dict[str, List[ContextRef]], str, str]:
     try:
         from datasets import load_from_disk
@@ -145,6 +147,8 @@ def _build_context_index(
     index: Dict[str, List[ContextRef]] = defaultdict(list)
     chosen_dialect_field: Optional[str] = None
     chosen_text_field: Optional[str] = None
+
+    text_pattern = re.compile(context_text_regex) if context_text_regex else None
 
     for split in splits:
         if split not in dataset_dict:
@@ -193,6 +197,8 @@ def _build_context_index(
                 continue
             text = str(text).strip()
             if not text:
+                continue
+            if text_pattern and not text_pattern.search(text):
                 continue
             audio_path = None
             if path_col is not None:
@@ -398,6 +404,15 @@ def main() -> None:
         help="Comma-separated candidate transcript fields in HF dataset (for context text)",
     )
     parser.add_argument(
+        "--context-text-regex",
+        help="Optional regex; only HF context texts matching it are eligible",
+    )
+    parser.add_argument(
+        "--context-number-like",
+        action="store_true",
+        help="Use only number-like HF context texts (digits or common number words)",
+    )
+    parser.add_argument(
         "--hf-audio-field",
         default="audio",
         help="Audio column name in HF dataset",
@@ -468,6 +483,17 @@ def main() -> None:
     hf_dialect_fields = _split_csv(args.hf_dialect_fields)
     hf_text_fields = _split_csv(args.hf_text_fields)
 
+    number_like_regex = (
+        r"(?i)(\d|\b(eis|ein|eine|eins|zwei|zwöi|zwo|drü|drei|vier|füf|fünf|"
+        r"sechs|sibe|sieben|acht|nün|neun|zäh|zehn|elf|zwölf|hundert|tausend)\b)"
+    )
+    context_text_regex = args.context_text_regex
+    if args.context_number_like:
+        if context_text_regex:
+            context_text_regex = f"(?:{context_text_regex})|(?:{number_like_regex})"
+        else:
+            context_text_regex = number_like_regex
+
     hf_audio_roots = [Path(x).expanduser().resolve() for x in _split_csv(args.hf_audio_roots)]
     if not hf_audio_roots:
         hf_audio_roots = [hf_dataset_path]
@@ -504,6 +530,7 @@ def main() -> None:
         text_fields=hf_text_fields,
         audio_field=args.hf_audio_field,
         aliases=aliases,
+        context_text_regex=context_text_regex,
     )
 
     all_context_refs = [x for refs in context_index.values() for x in refs]
@@ -535,7 +562,8 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     processed = 0
-    with output_path.open("a", encoding="utf-8") as out_f:
+    output_mode = "a" if args.resume else "w"
+    with output_path.open(output_mode, encoding="utf-8") as out_f:
         for dialect in dialects:
             records = grouped_manifest[dialect]
             if args.shuffle_within_dialect:
@@ -582,17 +610,13 @@ def main() -> None:
                     )
 
                 for rec, transcription in zip(batch, transcriptions):
-                    row = dict(rec.payload)
-                    row.update(
-                        {
-                            "manifest_line": rec.line_number,
-                            "omni_model_card": args.model_card,
-                            "omni_dialect": rec.dialect,
-                            "omni_context_size": len(context_examples),
-                            "omni_context": context_meta,
-                            "omni_transcription": transcription,
-                        }
-                    )
+                    src_text = rec.payload.get("text")
+                    row = {
+                        "audio_path": rec.audio_input,
+                        "dialect": rec.dialect,
+                        "text": src_text,
+                        "omni_text": transcription,
+                    }
                     out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
                     processed += 1
 

@@ -1,5 +1,5 @@
 #!/bin/sh
-#SBATCH --time=24:00:00
+#SBATCH --time=144:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --job-name srf_podcast_diarize
 #SBATCH --mem=32G
