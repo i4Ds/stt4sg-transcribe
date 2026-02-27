@@ -94,6 +94,49 @@ CANONICAL_TAG_ORDER = [
     "<gasp>",
 ]
 
+DEFAULT_TAG_MIN_DURATION_S = {
+    "<speech>": 0.15,
+    "<laugh>": 0.30,
+    "<chuckle>": 0.25,
+    "<sigh>": 0.12,
+    "<cough>": 0.08,
+    "<sniffle>": 0.08,
+    "<groan>": 0.15,
+    "<yawn>": 0.20,
+    "<gasp>": 0.10,
+}
+
+AGG_TAG_SLIDERS: list[tuple[str, str]] = [
+    ("<speech>", "Speech"),
+    ("<laugh>", "Laughter"),
+    ("<chuckle>", "Chuckle"),
+    ("<sigh>", "Sigh"),
+    ("<cough>", "Cough"),
+    ("<sniffle>", "Sniffle"),
+    ("<groan>", "Groan"),
+    ("<yawn>", "Yawn"),
+    ("<gasp>", "Gasp/Breathing"),
+]
+
+DISPLAY_TAG_LABEL = {
+    "<speech>": "Speech",
+    "<laugh>": "Laughter",
+    "<chuckle>": "Chuckle",
+    "<sigh>": "Sigh",
+    "<cough>": "Cough",
+    "<sniffle>": "Sniffle",
+    "<groan>": "Groan",
+    "<yawn>": "Yawn",
+    "<gasp>": "Gasp/Breathing",
+}
+
+
+def _pretty_tag_label(label: str) -> str:
+    canonical = _normalize_tag_label(label)
+    if canonical is None:
+        return label
+    return DISPLAY_TAG_LABEL.get(canonical, canonical)
+
 
 def _normalize_tag_label(label: str) -> str | None:
     raw = label.strip().lower()
@@ -133,6 +176,21 @@ def _canonical_rank(tag: str) -> int:
         return CANONICAL_TAG_ORDER.index(tag)
     except ValueError:
         return len(CANONICAL_TAG_ORDER)
+
+
+def _min_duration_for_tag(
+    label: str,
+    *,
+    scale: float,
+    floor: float,
+    overrides: dict[str, float] | None = None,
+) -> float:
+    normalized = _normalize_tag_label(label)
+    key = normalized if normalized is not None else label.strip().lower()
+    base = DEFAULT_TAG_MIN_DURATION_S.get(key, 0.15)
+    if overrides and key in overrides:
+        base = float(overrides[key])
+    return max(float(floor), float(base) * float(scale))
 
 
 class ManifestStore:
@@ -606,7 +664,9 @@ def _load_tag_events(record: dict[str, Any], min_tag_prob: float = 0.5) -> list[
                 prob_row = prob_rows[i]
                 if not isinstance(idx_row, list) or not isinstance(prob_row, list):
                     continue
+                raw_pairs: list[tuple[str, float]] = []
                 ranked_pairs: list[tuple[str, float]] = []
+                grouped: dict[str, float] = {}
                 for raw_idx, raw_prob in zip(idx_row, prob_row):
                     if not isinstance(raw_idx, int):
                         continue
@@ -618,10 +678,19 @@ def _load_tag_events(record: dict[str, Any], min_tag_prob: float = 0.5) -> list[
                     if prob < min_tag_prob:
                         continue
                     raw_label = TOPK_LABEL_VOCAB[raw_idx]
-                    if not isinstance(raw_label, str) or not raw_label.strip():
+                    canonical = _normalize_tag_label(raw_label)
+                    if canonical is None:
                         continue
-                    ranked_pairs.append((raw_label, prob))
+                    raw_pairs.append((raw_label, prob))
+                    old = grouped.get(canonical)
+                    grouped[canonical] = prob if old is None else max(old, prob)
 
+                raw_pairs = sorted(raw_pairs, key=lambda x: (-x[1], x[0]))
+                raw_top3 = raw_pairs[:3]
+                ranked_pairs = sorted(
+                    grouped.items(),
+                    key=lambda x: (-x[1], _canonical_rank(x[0]), x[0]),
+                )
                 clean_top3 = ranked_pairs[:3]
                 if not clean_top3:
                     continue
@@ -630,14 +699,18 @@ def _load_tag_events(record: dict[str, Any], min_tag_prob: float = 0.5) -> list[
                     if not _is_speech_tag(lbl):
                         display_label, display_score = lbl, prob
                         break
+                pretty_top3 = [(_pretty_tag_label(lbl), prob) for lbl, prob in clean_top3]
                 events.append(
                     {
                         "start": round(float(i) * step, 3),
                         "end": round(float(i + 1) * step, 3),
-                        "label": display_label,
+                        "label": _pretty_tag_label(display_label),
                         "score": round(float(display_score), 4),
                         "top3": [
-                            (lbl, round(float(prob), 4)) for lbl, prob in clean_top3
+                            (lbl, round(float(prob), 4)) for lbl, prob in pretty_top3
+                        ],
+                        "raw_top3": [
+                            (lbl, round(float(prob), 4)) for lbl, prob in raw_top3
                         ],
                     }
                 )
@@ -665,6 +738,7 @@ def _load_tag_events(record: dict[str, Any], min_tag_prob: float = 0.5) -> list[
                     "label": label.strip(),
                     "score": score_out,
                     "top3": [(label.strip(), score_out)],
+                    "raw_top3": [(label.strip(), score_out)],
                 }
             )
         if events:
@@ -713,6 +787,9 @@ def _load_tag_events(record: dict[str, Any], min_tag_prob: float = 0.5) -> list[
                         "top3": [
                             (lbl, round(float(prob), 4)) for lbl, prob in clean_top3[:3]
                         ],
+                        "raw_top3": [
+                            (lbl, round(float(prob), 4)) for lbl, prob in clean_top3[:3]
+                        ],
                     }
                 )
         if events:
@@ -738,6 +815,7 @@ def _load_tag_events(record: dict[str, Any], min_tag_prob: float = 0.5) -> list[
                 "label": clean,
                 "score": score,
                 "top3": [(clean, score)],
+                "raw_top3": [(clean, score)],
             }
         )
     if fallback:
@@ -783,6 +861,19 @@ def _svg_track_rects(
             title_bits.append(f"{label}: {score:.3f}")
         else:
             title_bits.append(label)
+        raw_top3 = row.get("raw_top3")
+        if isinstance(raw_top3, list) and raw_top3:
+            raw_bits = []
+            for pair in raw_top3[:3]:
+                if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                    continue
+                raw_label = pair[0]
+                raw_prob = _as_float(pair[1])
+                if not isinstance(raw_label, str) or raw_prob is None:
+                    continue
+                raw_bits.append(f"{raw_label} {raw_prob:.3f}")
+            if raw_bits:
+                title_bits.append(f"Raw: {', '.join(raw_bits)}")
         segments.append(
             {
                 "x": x,
@@ -870,6 +961,8 @@ def _tag_rank_rows(
     rank_idx: int,
     *,
     min_duration_s: float = 0.0,
+    per_tag_scale: float = 1.0,
+    per_tag_overrides: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     out = []
     for row in tag_events:
@@ -893,19 +986,28 @@ def _tag_rank_rows(
                 "label": label,
                 "score": prob,
                 "top3": top3,
+                "raw_top3": row.get("raw_top3"),
             }
         )
     merged = _merge_adjacent_tag_rows(out)
     min_duration_s = max(0.0, float(min_duration_s))
-    if min_duration_s <= 0:
-        return merged
+    per_tag_scale = max(0.0, float(per_tag_scale))
     kept = []
     for row in merged:
         start = _as_float(row.get("start"))
         end = _as_float(row.get("end"))
+        label = row.get("label")
         if start is None or end is None:
             continue
-        if (end - start) >= min_duration_s:
+        if not isinstance(label, str):
+            continue
+        min_needed = _min_duration_for_tag(
+            label,
+            scale=per_tag_scale,
+            floor=min_duration_s,
+            overrides=per_tag_overrides,
+        )
+        if (end - start) >= min_needed:
             kept.append(row)
     return kept
 
@@ -932,6 +1034,7 @@ def _merge_adjacent_tag_rows(
                 "end": end,
                 "label": label,
                 "score": 0.0 if score is None else score,
+                "raw_top3": row.get("raw_top3"),
             }
         )
 
@@ -948,8 +1051,8 @@ def _merge_adjacent_tag_rows(
                     "start": row["start"],
                     "end": row["end"],
                     "label": row["label"],
-                    "_score_sum": row["score"] * dur,
-                    "_dur_sum": dur,
+                    "_score_max": row["score"],
+                    "_raw_top3": row.get("raw_top3"),
                 }
             )
             continue
@@ -957,30 +1060,30 @@ def _merge_adjacent_tag_rows(
         prev = merged[-1]
         if row["label"] == prev["label"] and row["start"] <= prev["end"] + merge_gap:
             prev["end"] = max(prev["end"], row["end"])
-            prev["_score_sum"] += row["score"] * dur
-            prev["_dur_sum"] += dur
+            if row["score"] >= float(prev["_score_max"]):
+                prev["_raw_top3"] = row.get("raw_top3")
+            prev["_score_max"] = max(float(prev["_score_max"]), row["score"])
         else:
             merged.append(
                 {
                     "start": row["start"],
                     "end": row["end"],
                     "label": row["label"],
-                    "_score_sum": row["score"] * dur,
-                    "_dur_sum": dur,
+                    "_score_max": row["score"],
+                    "_raw_top3": row.get("raw_top3"),
                 }
             )
 
     out: list[dict[str, Any]] = []
     for row in merged:
-        dur_sum = float(row.get("_dur_sum", 0.0))
-        score_sum = float(row.get("_score_sum", 0.0))
-        avg = score_sum / dur_sum if dur_sum > 0 else 0.0
+        score_max = float(row.get("_score_max", 0.0))
         out.append(
             {
                 "start": round(float(row["start"]), 3),
                 "end": round(float(row["end"]), 3),
                 "label": str(row["label"]),
-                "score": round(avg, 4),
+                "score": round(score_max, 4),
+                "raw_top3": row.get("_raw_top3"),
             }
         )
     return out
@@ -990,6 +1093,8 @@ def _fmt_timeline_html(
     record: dict[str, Any],
     min_tag_prob: float = 0.5,
     min_tag_duration_s: float = 0.0,
+    tag_duration_scale: float = 1.0,
+    per_tag_overrides: dict[str, float] | None = None,
 ) -> str:
     emotion_timeline = _emotion_timeline(record)
     tag_events = _load_tag_events(record, min_tag_prob=min_tag_prob)
@@ -1015,9 +1120,27 @@ def _fmt_timeline_html(
     else:
         overall_html = "<b>Overall sentence emotion:</b> not available yet"
 
-    tag_rank1 = _tag_rank_rows(tag_events, 0, min_duration_s=min_tag_duration_s)
-    tag_rank2 = _tag_rank_rows(tag_events, 1, min_duration_s=min_tag_duration_s)
-    tag_rank3 = _tag_rank_rows(tag_events, 2, min_duration_s=min_tag_duration_s)
+    tag_rank1 = _tag_rank_rows(
+        tag_events,
+        0,
+        min_duration_s=min_tag_duration_s,
+        per_tag_scale=tag_duration_scale,
+        per_tag_overrides=per_tag_overrides,
+    )
+    tag_rank2 = _tag_rank_rows(
+        tag_events,
+        1,
+        min_duration_s=min_tag_duration_s,
+        per_tag_scale=tag_duration_scale,
+        per_tag_overrides=per_tag_overrides,
+    )
+    tag_rank3 = _tag_rank_rows(
+        tag_events,
+        2,
+        min_duration_s=min_tag_duration_s,
+        per_tag_scale=tag_duration_scale,
+        per_tag_overrides=per_tag_overrides,
+    )
     container_id = f"mb-{random.randrange(1_000_000_000):x}"
 
     svg_w = 1000.0
@@ -1353,10 +1476,16 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
     }
     fixed_manifest = Path(default_manifest).expanduser()
     initial_min_tag_prob = 0.5
-    initial_min_tag_duration_s = 0.2
+    initial_min_tag_duration_s = 0.0
+    initial_tag_duration_scale = 1.0
+    slider_tag_keys = [k for k, _ in AGG_TAG_SLIDERS]
 
     def _row_bundle(
-        record: dict[str, Any], min_tag_prob: float, min_tag_duration_s: float
+        record: dict[str, Any],
+        min_tag_prob: float,
+        min_tag_duration_s: float,
+        tag_duration_scale: float,
+        per_tag_overrides: dict[str, float],
     ):
         audio = str(record.get("audio_path", ""))
         if not audio or not Path(audio).exists():
@@ -1367,6 +1496,8 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
                 record,
                 min_tag_prob=min_tag_prob,
                 min_tag_duration_s=min_tag_duration_s,
+                tag_duration_scale=tag_duration_scale,
+                per_tag_overrides=per_tag_overrides,
             ),
             _fmt_record_summary(record),
             json.dumps(record, ensure_ascii=False, indent=2),
@@ -1405,7 +1536,11 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
                 browser["current_row_id"] = row_id
                 initial_audio, initial_timeline, initial_summary, initial_raw = (
                     _row_bundle(
-                        row, initial_min_tag_prob, initial_min_tag_duration_s
+                        row,
+                        initial_min_tag_prob,
+                        initial_min_tag_duration_s,
+                        initial_tag_duration_scale,
+                        {},
                     )
                 )
 
@@ -1424,8 +1559,39 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
             maximum=2.0,
             step=0.05,
             value=initial_min_tag_duration_s,
-            label="Min tag duration (s)",
+            label="Min tag duration floor (s)",
         )
+        tag_duration_scale_slider = gr.Slider(
+            minimum=0.5,
+            maximum=2.0,
+            step=0.05,
+            value=initial_tag_duration_scale,
+            label="Per-tag duration scale",
+        )
+        gr.Markdown("### Per-tag Min Duration (s)")
+        per_tag_sliders: dict[str, gr.Slider] = {}
+        split = (len(slider_tag_keys) + 1) // 2
+        left_items = AGG_TAG_SLIDERS[:split]
+        right_items = AGG_TAG_SLIDERS[split:]
+        with gr.Row():
+            with gr.Column():
+                for key, label in left_items:
+                    per_tag_sliders[key] = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.01,
+                        value=float(DEFAULT_TAG_MIN_DURATION_S.get(key, 0.15)),
+                        label=label,
+                    )
+            with gr.Column():
+                for key, label in right_items:
+                    per_tag_sliders[key] = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.01,
+                        value=float(DEFAULT_TAG_MIN_DURATION_S.get(key, 0.15)),
+                        label=label,
+                    )
 
         status_md = gr.Markdown(initial_status)
         audio_player = gr.Audio(
@@ -1436,8 +1602,23 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
         timeline_md = gr.HTML(initial_timeline)
         summary_md = gr.Markdown(initial_summary)
         raw_json = gr.Code(label="Raw record JSON", language="json", value=initial_raw)
+        per_tag_input_components = [per_tag_sliders[k] for k in slider_tag_keys]
 
-        def refresh_sample(min_tag_prob: float, min_tag_duration_s: float):
+        def _build_overrides(values: tuple[float, ...]) -> dict[str, float]:
+            overrides: dict[str, float] = {}
+            for key, value in zip(slider_tag_keys, values):
+                try:
+                    overrides[key] = max(0.0, float(value))
+                except Exception:
+                    continue
+            return overrides
+
+        def refresh_sample(
+            min_tag_prob: float,
+            min_tag_duration_s: float,
+            tag_duration_scale: float,
+            *tag_values: float,
+        ):
             store = browser.get("store")
             total_rows = int(browser.get("total_rows", 0))
             eligible_rows = int(browser.get("eligible_rows", 0))
@@ -1460,8 +1641,13 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
                 )
             row_id, row = picked
             browser["current_row_id"] = row_id
+            overrides = _build_overrides(tuple(tag_values))
             audio, timeline_html, summary, raw = _row_bundle(
-                row, min_tag_prob, min_tag_duration_s
+                row,
+                min_tag_prob,
+                min_tag_duration_s,
+                tag_duration_scale,
+                overrides,
             )
             return (
                 f"Loaded **{total_rows:,}** rows. "
@@ -1472,33 +1658,77 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
                 raw,
             )
 
-        def refresh_timeline(min_tag_prob: float, min_tag_duration_s: float):
+        def refresh_timeline(
+            min_tag_prob: float,
+            min_tag_duration_s: float,
+            tag_duration_scale: float,
+            *tag_values: float,
+        ):
             store = browser.get("store")
             row_id = browser.get("current_row_id")
             if store is None or not isinstance(row_id, int):
                 return "<div>No timeline available.</div>"
             row = store.get_row(row_id)
+            overrides = _build_overrides(tuple(tag_values))
             return _fmt_timeline_html(
                 row,
                 min_tag_prob=min_tag_prob,
                 min_tag_duration_s=min_tag_duration_s,
+                tag_duration_scale=tag_duration_scale,
+                per_tag_overrides=overrides,
             )
 
         random_btn.click(
             refresh_sample,
-            inputs=[tag_prob_slider, tag_duration_slider],
+            inputs=[
+                tag_prob_slider,
+                tag_duration_slider,
+                tag_duration_scale_slider,
+                *per_tag_input_components,
+            ],
             outputs=[status_md, audio_player, timeline_md, summary_md, raw_json],
         )
         tag_prob_slider.change(
             refresh_timeline,
-            inputs=[tag_prob_slider, tag_duration_slider],
+            inputs=[
+                tag_prob_slider,
+                tag_duration_slider,
+                tag_duration_scale_slider,
+                *per_tag_input_components,
+            ],
             outputs=[timeline_md],
         )
         tag_duration_slider.change(
             refresh_timeline,
-            inputs=[tag_prob_slider, tag_duration_slider],
+            inputs=[
+                tag_prob_slider,
+                tag_duration_slider,
+                tag_duration_scale_slider,
+                *per_tag_input_components,
+            ],
             outputs=[timeline_md],
         )
+        tag_duration_scale_slider.change(
+            refresh_timeline,
+            inputs=[
+                tag_prob_slider,
+                tag_duration_slider,
+                tag_duration_scale_slider,
+                *per_tag_input_components,
+            ],
+            outputs=[timeline_md],
+        )
+        for slider in per_tag_input_components:
+            slider.change(
+                refresh_timeline,
+                inputs=[
+                    tag_prob_slider,
+                    tag_duration_slider,
+                    tag_duration_scale_slider,
+                    *per_tag_input_components,
+                ],
+                outputs=[timeline_md],
+            )
 
     return app
 
