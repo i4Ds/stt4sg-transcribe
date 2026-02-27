@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torchaudio
 from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
+from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +262,25 @@ def _build_frame_starts(
     return starts
 
 
+def _smooth_frame_probs(probs: np.ndarray, window_frames: int) -> np.ndarray:
+    if probs.ndim != 2 or probs.shape[0] == 0:
+        return probs
+    if window_frames <= 1:
+        return probs
+
+    window = int(window_frames)
+    if window % 2 == 0:
+        window += 1
+    pad = window // 2
+    kernel = np.ones((window,), dtype=np.float32) / float(window)
+
+    padded = np.pad(probs, ((pad, pad), (0, 0)), mode="edge")
+    out = np.empty_like(probs, dtype=np.float32)
+    for col in range(probs.shape[1]):
+        out[:, col] = np.convolve(padded[:, col], kernel, mode="valid")
+    return out
+
+
 def _predict_framewise(
     model,
     feature_extractor,
@@ -328,6 +348,7 @@ def _tag_audio(
     save_raw_frames: bool,
     raw_top_k: int,
     min_prob: float,
+    aggregation_window_frames: int,
     segment_start: float = 0.0,
 ) -> Dict[str, object]:
     frames = _predict_framewise(
@@ -358,14 +379,13 @@ def _tag_audio(
         [[float(probs[idx]) for idx in label_indices] for _, _, probs in frames],
         axis=0,
     )
-    max_probs = selected_probs.max(axis=0)
+    smoothed_probs = _smooth_frame_probs(selected_probs, aggregation_window_frames)
+    max_probs = smoothed_probs.max(axis=0)
 
     frame_entries = []
     raw_entries = []
-    for t0, t1, probs in frames:
-        frame_tags = {
-            label: float(probs[idx]) for label, idx in zip(label_names, label_indices)
-        }
+    for frame_idx, (t0, t1, probs) in enumerate(frames):
+        frame_tags = {label: float(v) for label, v in zip(label_names, smoothed_probs[frame_idx])}
         filtered_frame_tags = _round_probs(frame_tags, round_digits, min_prob)
         if filtered_frame_tags:
             best_idx = int(np.argmax(probs))
@@ -429,6 +449,7 @@ def _tag_entry(
     save_raw_frames: bool,
     raw_top_k: int,
     min_prob: float,
+    aggregation_window_frames: int,
     cache_audio: bool,
     audio_cache: Dict[Path, Tuple[np.ndarray, int]],
     device: str,
@@ -475,6 +496,7 @@ def _tag_entry(
                 save_raw_frames=save_raw_frames,
                 raw_top_k=raw_top_k,
                 min_prob=min_prob,
+                aggregation_window_frames=aggregation_window_frames,
                 segment_start=0.0,
             )
         )
@@ -496,6 +518,15 @@ def _iter_jsonl(path: Path) -> Iterable[Tuple[int, Dict]]:
                 logger.warning("Skipping line %d: JSON decode error: %s", line_num, exc)
 
 
+def _count_jsonl_entries(path: Path) -> int:
+    total = 0
+    with open(path, "r", encoding="utf-8") as infile:
+        for line in infile:
+            if line.strip():
+                total += 1
+    return total
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Framewise AudioSet tagging with AST")
     parser.add_argument("manifest", type=Path, help="Path to manifest.jsonl")
@@ -510,6 +541,12 @@ def main() -> int:
     parser.add_argument("--context-seconds", type=float, default=1.0)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--round", type=int, default=3, help="Use -1 to disable")
+    parser.add_argument(
+        "--aggregation-window-frames",
+        type=int,
+        default=5,
+        help="Temporal smoothing window over frame probabilities (odd window; <=1 disables).",
+    )
     parser.add_argument("--save-raw-frames", action="store_true")
     parser.add_argument("--raw-top-k", type=int, default=10)
     parser.add_argument("--minimal-output", action="store_true")
@@ -535,6 +572,9 @@ def main() -> int:
         return 1
     if args.min_prob < 0.0 or args.min_prob > 1.0:
         logger.error("--min-prob must be between 0.0 and 1.0")
+        return 1
+    if args.aggregation_window_frames < 1:
+        logger.error("--aggregation-window-frames must be >= 1")
         return 1
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -580,6 +620,7 @@ def main() -> int:
             "batch_size": args.batch_size,
             "round_digits": round_digits,
             "min_prob": args.min_prob,
+            "aggregation_window_frames": args.aggregation_window_frames,
             "device": device,
             "target_labels": label_names,
         },
@@ -588,12 +629,25 @@ def main() -> int:
 
     audio_cache: Dict[Path, Tuple[np.ndarray, int]] = {}
 
+    total_entries = _count_jsonl_entries(args.manifest)
+    written_entries = 0
+    skipped_entries = 0
+
     with open(output_path, "a", encoding="utf-8") as outfile:
-        for _, entry in _iter_jsonl(args.manifest):
+        iterator = tqdm(
+            _iter_jsonl(args.manifest),
+            total=total_entries,
+            desc="APR tagging",
+            unit="entry",
+            dynamic_ncols=True,
+        )
+        for _, entry in iterator:
             entry_audio_keys = _collect_audio_keys(entry, base_dir)
             if entry_audio_keys and all(
                 key in processed_audio_keys for key in entry_audio_keys
             ):
+                skipped_entries += 1
+                iterator.set_postfix(written=written_entries, skipped=skipped_entries)
                 continue
 
             tagged = _tag_entry(
@@ -612,6 +666,7 @@ def main() -> int:
                 save_raw_frames=args.save_raw_frames,
                 raw_top_k=args.raw_top_k,
                 min_prob=args.min_prob,
+                aggregation_window_frames=args.aggregation_window_frames,
                 cache_audio=not args.no_cache,
                 audio_cache=audio_cache,
                 device=device,
@@ -634,8 +689,15 @@ def main() -> int:
             else:
                 outfile.write(json.dumps(tagged, ensure_ascii=False) + "\n")
             processed_audio_keys.update(entry_audio_keys)
+            written_entries += 1
+            iterator.set_postfix(written=written_entries, skipped=skipped_entries)
 
-    logger.info("Tagged manifest written to %s", output_path)
+    logger.info(
+        "Tagged manifest written to %s (written=%d, skipped=%d)",
+        output_path,
+        written_entries,
+        skipped_entries,
+    )
     return 0
 
 

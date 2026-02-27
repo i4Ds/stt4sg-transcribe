@@ -17,79 +17,6 @@ DEFAULT_MANIFEST = (
     "/mnt/nas05/data02/vincenzo/podcast_data/youtube/processed/manifest_combined.jsonl"
 )
 
-TIMELINE_SEEK_HEAD = """
-<script>
-(() => {
-  window.__mbBindTimelineSeek = () => {
-    if (window.__mbTimelineSeekBound) return;
-    const findAudioElement = () => {
-      const direct = document.querySelector("#segment_audio_player audio");
-      if (direct) return direct;
-      const queue = [document.documentElement];
-      while (queue.length) {
-        const node = queue.shift();
-      if (!node) continue;
-      if (node.querySelector) {
-        const a = node.querySelector("audio");
-        if (a) return a;
-      }
-      const children = node.children || [];
-      for (const child of children) queue.push(child);
-      if (node.shadowRoot) queue.push(node.shadowRoot);
-    }
-    return null;
-      };
-    };
-
-    const seekAudio = (audio, seek) => {
-      const apply = () => {
-        const maxT = Number.isFinite(audio.duration) && audio.duration > 0
-          ? Math.max(0, audio.duration - 0.05)
-          : seek;
-        audio.currentTime = Math.max(0, Math.min(seek, maxT));
-        const p = audio.play();
-        if (p && typeof p.catch === "function") p.catch(() => {});
-      };
-      if (Number.isFinite(audio.duration) && audio.duration > 0) {
-        apply();
-        return;
-      }
-      audio.addEventListener("loadedmetadata", apply, { once: true });
-      audio.load?.();
-    };
-
-    const onPointer = (event) => {
-      const node = event.target && event.target.closest
-        ? event.target.closest(".mb-hover-seg")
-        : null;
-      if (!node) return;
-      const raw = node.getAttribute("data-start");
-      const parsed = Number.parseFloat(raw || "0");
-      const seek = Math.max(0, (Number.isFinite(parsed) ? parsed : 0) - 0.2);
-      const audio = findAudioElement();
-      if (!audio) return;
-      try {
-        seekAudio(audio, seek);
-      } catch (_err) {}
-      event.preventDefault();
-      event.stopPropagation();
-    };
-    document.addEventListener("pointerdown", onPointer, true);
-    window.__mbTimelineSeekBound = true;
-  };
-  window.__mbBindTimelineSeek();
-})();
-</script>
-"""
-
-TIMELINE_SEEK_JS = """
-() => {
-  if (typeof window.__mbBindTimelineSeek === "function") {
-    window.__mbBindTimelineSeek();
-  }
-}
-"""
-
 
 def _extract_string_list_from_module(module_path: Path, var_name: str) -> list[str]:
     if not module_path.exists():
@@ -140,6 +67,21 @@ SPEECH_TAGS = {
     if isinstance(label, str) and label.strip()
 }
 
+
+def _load_topk_label_vocab() -> list[str]:
+    sed_path = Path(__file__).resolve().with_name("audio_pattern_recognition_sed.py")
+    labels = _extract_string_list_from_module(sed_path, "NON_SPEECH_TARGET_LABELS")
+    if not labels:
+        human = _extract_string_list_from_module(sed_path, "HUMAN_VOICE_LABELS")
+        respiratory = _extract_string_list_from_module(sed_path, "RESPIRATORY_LABELS")
+        labels = human + respiratory
+    if not labels:
+        labels = _extract_string_list_from_module(sed_path, "TARGET_LABELS")
+    return [x for x in labels if isinstance(x, str) and x.strip()]
+
+
+TOPK_LABEL_VOCAB = _load_topk_label_vocab()
+
 CANONICAL_TAG_ORDER = [
     "<speech>",
     "<laugh>",
@@ -163,9 +105,9 @@ def _normalize_tag_label(label: str) -> str | None:
     if raw in SPEECH_TAGS:
         return "<speech>"
 
-    if raw in {"laughter", "baby laughter", "giggle", "belly laugh"}:
+    if raw in {"laughter", "baby laughter", "belly laugh"}:
         return "<laugh>"
-    if raw in {"snicker", "chuckle, chortle"}:
+    if raw in {"snicker", "chuckle, chortle", "giggle"}:
         return "<chuckle>"
     if raw in {"sigh"}:
         return "<sigh>"
@@ -249,6 +191,17 @@ def _row_has_emotion_and_tags(record: dict[str, Any]) -> bool:
         record.get("audio_tag_top3_frames")
     )
     if not has_tags:
+        topk = record.get("audio_tag_topk")
+        has_tags = (
+            isinstance(topk, dict)
+            and isinstance(topk.get("top_idx"), list)
+            and bool(topk.get("top_idx"))
+        )
+    if not has_tags:
+        has_tags = isinstance(record.get("audio_tag_events"), list) and bool(
+            record.get("audio_tag_events")
+        )
+    if not has_tags:
         has_tags = isinstance(record.get("audio_tag_frames"), list) and bool(
             record.get("audio_tag_frames")
         )
@@ -257,53 +210,6 @@ def _row_has_emotion_and_tags(record: dict[str, Any]) -> bool:
             record.get("audio_tag_timeline")
         )
     return has_emotion and has_tags
-
-
-class TaggedManifestIndex:
-    """Byte-offset index for looking up frame-level tag rows by audio_path."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.offset_by_audio: dict[str, int] = {}
-
-    def build(self) -> int:
-        self.offset_by_audio.clear()
-        if not self.path.exists():
-            return 0
-        with self.path.open("rb") as f:
-            while True:
-                offset = f.tell()
-                line = f.readline()
-                if not line:
-                    break
-                raw = line.strip()
-                if not raw:
-                    continue
-                try:
-                    row = json.loads(raw.decode("utf-8"))
-                except Exception:
-                    continue
-                if not isinstance(row, dict):
-                    continue
-                audio_path = row.get("audio_path")
-                if isinstance(audio_path, str) and audio_path:
-                    self.offset_by_audio[audio_path] = offset
-        return len(self.offset_by_audio)
-
-    def get_row(self, audio_path: str) -> dict[str, Any] | None:
-        offset = self.offset_by_audio.get(audio_path)
-        if offset is None:
-            return None
-        with self.path.open("rb") as f:
-            f.seek(offset)
-            line = f.readline().decode("utf-8").strip()
-        if not line:
-            return None
-        try:
-            row = json.loads(line)
-        except Exception:
-            return None
-        return row if isinstance(row, dict) else None
 
 
 def _derive_podcast_and_title(record: dict[str, Any]) -> tuple[str, str]:
@@ -337,10 +243,10 @@ def _fmt_clock(value: Any) -> str:
         sec = 0.0
     h = int(sec // 3600)
     m = int((sec % 3600) // 60)
-    s = sec % 60
+    s = int(sec % 60)
     if h > 0:
-        return f"{h:02d}:{m:02d}:{s:05.2f}"
-    return f"{m:02d}:{s:05.2f}"
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
 
 def _as_float(value: Any) -> float | None:
@@ -672,9 +578,98 @@ def _non_speech_tag_events_from_frames(
     return final_events
 
 
-def _load_tag_events(
-    record: dict[str, Any], tagged_index: TaggedManifestIndex | None
-) -> list[dict[str, Any]]:
+def _load_tag_events(record: dict[str, Any], min_tag_prob: float = 0.5) -> list[dict[str, Any]]:
+    min_tag_prob = max(0.0, min(1.0, float(min_tag_prob)))
+    topk = record.get("audio_tag_topk")
+    if isinstance(topk, dict):
+        idx_rows = topk.get("top_idx")
+        prob_rows = topk.get("top_prob")
+        if isinstance(idx_rows, list) and isinstance(prob_rows, list):
+            row_count = min(len(idx_rows), len(prob_rows))
+            duration = _as_float(record.get("duration"))
+            if duration is None or duration <= 0:
+                seg_start = _as_float(record.get("start"))
+                seg_end = _as_float(record.get("end"))
+                if (
+                    seg_start is not None
+                    and seg_end is not None
+                    and seg_end > seg_start
+                ):
+                    duration = seg_end - seg_start
+            if duration is None or duration <= 0:
+                duration = float(max(row_count, 1)) * 0.02
+            step = duration / float(max(row_count, 1))
+
+            events = []
+            for i in range(row_count):
+                idx_row = idx_rows[i]
+                prob_row = prob_rows[i]
+                if not isinstance(idx_row, list) or not isinstance(prob_row, list):
+                    continue
+                ranked_pairs: list[tuple[str, float]] = []
+                for raw_idx, raw_prob in zip(idx_row, prob_row):
+                    if not isinstance(raw_idx, int):
+                        continue
+                    if raw_idx < 0 or raw_idx >= len(TOPK_LABEL_VOCAB):
+                        continue
+                    prob = _as_float(raw_prob)
+                    if prob is None:
+                        continue
+                    if prob < min_tag_prob:
+                        continue
+                    raw_label = TOPK_LABEL_VOCAB[raw_idx]
+                    if not isinstance(raw_label, str) or not raw_label.strip():
+                        continue
+                    ranked_pairs.append((raw_label, prob))
+
+                clean_top3 = ranked_pairs[:3]
+                if not clean_top3:
+                    continue
+                display_label, display_score = clean_top3[0]
+                for lbl, prob in clean_top3:
+                    if not _is_speech_tag(lbl):
+                        display_label, display_score = lbl, prob
+                        break
+                events.append(
+                    {
+                        "start": round(float(i) * step, 3),
+                        "end": round(float(i + 1) * step, 3),
+                        "label": display_label,
+                        "score": round(float(display_score), 4),
+                        "top3": [
+                            (lbl, round(float(prob), 4)) for lbl, prob in clean_top3
+                        ],
+                    }
+                )
+            if events:
+                return events
+
+    if isinstance(record.get("audio_tag_events"), list):
+        events = []
+        for row in record["audio_tag_events"]:
+            if not isinstance(row, dict):
+                continue
+            label = row.get("label")
+            if not isinstance(label, str):
+                continue
+            score = _as_float(row.get("score_mean"))
+            if score is None:
+                score = _as_float(row.get("score_max"))
+            if score is not None and score < min_tag_prob:
+                continue
+            score_out = round(float(score), 4) if score is not None else 0.0
+            events.append(
+                {
+                    "start": row.get("start"),
+                    "end": row.get("end"),
+                    "label": label.strip(),
+                    "score": score_out,
+                    "top3": [(label.strip(), score_out)],
+                }
+            )
+        if events:
+            return events
+
     if isinstance(record.get("audio_tag_top3_frames"), list):
         events = []
         for row in record["audio_tag_top3_frames"]:
@@ -692,14 +687,16 @@ def _load_tag_events(
                         prob = _as_float(pair[1])
                         if prob is None:
                             continue
-                        canonical = _normalize_tag_label(pair[0])
-                        if canonical is None:
+                        if prob < min_tag_prob:
                             continue
-                        old = grouped.get(canonical)
-                        grouped[canonical] = prob if old is None else max(old, prob)
+                        label = pair[0].strip()
+                        if not label:
+                            continue
+                        old = grouped.get(label)
+                        grouped[label] = prob if old is None else max(old, prob)
             clean_top3 = sorted(
                 grouped.items(),
-                key=lambda x: (-x[1], _canonical_rank(x[0]), x[0]),
+                key=lambda x: (-x[1], x[0]),
             )[:3]
             if clean_top3:
                 display_label, display_score = clean_top3[0]
@@ -713,7 +710,9 @@ def _load_tag_events(
                         "end": row.get("end"),
                         "label": display_label,
                         "score": round(float(display_score), 4),
-                        "top3": [(lbl, round(float(prob), 4)) for lbl, prob in clean_top3[:3]],
+                        "top3": [
+                            (lbl, round(float(prob), 4)) for lbl, prob in clean_top3[:3]
+                        ],
                     }
                 )
         if events:
@@ -722,33 +721,29 @@ def _load_tag_events(
     if isinstance(record.get("audio_tag_frames"), list):
         return _non_speech_tag_events_from_frames(record["audio_tag_frames"])
 
-    if tagged_index is not None:
-        audio_path = record.get("audio_path")
-        if isinstance(audio_path, str) and audio_path:
-            tagged_row = tagged_index.get_row(audio_path)
-            if tagged_row and isinstance(tagged_row.get("audio_tag_frames"), list):
-                return _non_speech_tag_events_from_frames(
-                    tagged_row["audio_tag_frames"]
-                )
-
     # Fallback: use collapsed timeline if full frames are unavailable.
     fallback = []
     for row in _tag_timeline(record):
         label = str(row.get("label", ""))
-        canonical = _normalize_tag_label(label)
-        if canonical is None:
+        clean = label.strip()
+        if not clean:
             continue
         score = round(float(row.get("score", 0.0) or 0.0), 4)
+        if score < min_tag_prob:
+            continue
         fallback.append(
             {
                 "start": row.get("start"),
                 "end": row.get("end"),
-                "label": canonical,
+                "label": clean,
                 "score": score,
-                "top3": [(canonical, score)],
+                "top3": [(clean, score)],
             }
         )
-    return fallback
+    if fallback:
+        return fallback
+
+    return []
 
 
 def _svg_track_rects(
@@ -859,7 +854,7 @@ def _svg_track_rects(
             f'class="mb-seg-text" font-size="10" font-weight="600">{text}</text></g>'
         )
         hover_out.append(
-            f'<g class="mb-seg-group"><rect class="mb-hover-seg" data-start="{start:.3f}" '
+            f'<g class="mb-seg-group"><rect class="mb-hover-seg" '
             f'x="{x:.2f}" y="{y:.2f}" width="{w:.2f}" height="{height:.2f}" '
             f'rx="1.5" fill="rgba(0,0,0,0)"><title>{title}</title></rect>'
             f'<g class="mb-hover-tip"><rect x="{tip_x:.2f}" y="{tip_y:.2f}" '
@@ -871,7 +866,10 @@ def _svg_track_rects(
 
 
 def _tag_rank_rows(
-    tag_events: list[dict[str, Any]], rank_idx: int
+    tag_events: list[dict[str, Any]],
+    rank_idx: int,
+    *,
+    min_duration_s: float = 0.0,
 ) -> list[dict[str, Any]]:
     out = []
     for row in tag_events:
@@ -897,7 +895,19 @@ def _tag_rank_rows(
                 "top3": top3,
             }
         )
-    return _merge_adjacent_tag_rows(out)
+    merged = _merge_adjacent_tag_rows(out)
+    min_duration_s = max(0.0, float(min_duration_s))
+    if min_duration_s <= 0:
+        return merged
+    kept = []
+    for row in merged:
+        start = _as_float(row.get("start"))
+        end = _as_float(row.get("end"))
+        if start is None or end is None:
+            continue
+        if (end - start) >= min_duration_s:
+            kept.append(row)
+    return kept
 
 
 def _merge_adjacent_tag_rows(
@@ -977,10 +987,12 @@ def _merge_adjacent_tag_rows(
 
 
 def _fmt_timeline_html(
-    record: dict[str, Any], tagged_index: TaggedManifestIndex | None
+    record: dict[str, Any],
+    min_tag_prob: float = 0.5,
+    min_tag_duration_s: float = 0.0,
 ) -> str:
     emotion_timeline = _emotion_timeline(record)
-    tag_events = _load_tag_events(record, tagged_index)
+    tag_events = _load_tag_events(record, min_tag_prob=min_tag_prob)
     total = _segment_duration(record, [emotion_timeline, tag_events])
     if total <= 0:
         total = 1.0
@@ -1003,9 +1015,9 @@ def _fmt_timeline_html(
     else:
         overall_html = "<b>Overall sentence emotion:</b> not available yet"
 
-    tag_rank1 = _tag_rank_rows(tag_events, 0)
-    tag_rank2 = _tag_rank_rows(tag_events, 1)
-    tag_rank3 = _tag_rank_rows(tag_events, 2)
+    tag_rank1 = _tag_rank_rows(tag_events, 0, min_duration_s=min_tag_duration_s)
+    tag_rank2 = _tag_rank_rows(tag_events, 1, min_duration_s=min_tag_duration_s)
+    tag_rank3 = _tag_rank_rows(tag_events, 2, min_duration_s=min_tag_duration_s)
     container_id = f"mb-{random.randrange(1_000_000_000):x}"
 
     svg_w = 1000.0
@@ -1062,7 +1074,6 @@ def _fmt_timeline_html(
         lane_name="Tag #3",
         squish_px=2.2,
     )
-
     return f"""
 <style>
 .mb-wrap {{
@@ -1285,24 +1296,15 @@ def _fmt_dialect_markdown(record: dict[str, Any]) -> str:
     speaker_name = record.get("dialect_speaker_majority_name")
     speaker_code = record.get("dialect_speaker_majority")
 
-    has_speaker = speaker_name is not None or speaker_code is not None
-
-    if has_speaker:
-        lines.append("Speaker majority dialect")
+    if speaker_name is not None or speaker_code is not None:
         lines.append(
             f"<div style='font-size: 1.18rem; font-weight: 800; line-height: 1.35;'>"
             f"{speaker_name or '-'} ({speaker_code or '-'})"
             f"</div>"
         )
-        lines.append(
-            "  Majority-vote dialect across multiple segments spoken by the same speaker."
-        )
-    if not has_speaker:
+        lines.append("Majority vote over multiple sentences for the same speaker.")
+    else:
         lines.append("_Not available yet._")
-
-    omni_dialect = record.get("omni_dialect")
-    if isinstance(omni_dialect, str) and omni_dialect:
-        lines.append(f"- Omni dialect: {omni_dialect}")
     return "\n".join(lines)
 
 
@@ -1311,23 +1313,9 @@ def _fmt_omni_markdown(record: dict[str, Any]) -> str:
 
     omni_text = record.get("omni_text")
     if isinstance(omni_text, str) and omni_text:
-        variant = record.get("omni_variant", "default")
-        lines.append(f"- Selected variant: `{variant}`")
         lines.append(omni_text)
     else:
         lines.append("_Not available yet._")
-
-    variants = record.get("omni_variants")
-    if isinstance(variants, dict) and variants:
-        lines.append("#### Variants")
-        for variant_name in sorted(variants):
-            payload = variants.get(variant_name)
-            if not isinstance(payload, dict):
-                continue
-            variant_text = payload.get("omni_text")
-            if not isinstance(variant_text, str) or not variant_text:
-                continue
-            lines.append(f"- `{variant_name}`: {variant_text}")
     return "\n".join(lines)
 
 
@@ -1343,9 +1331,9 @@ def _fmt_record_summary(record: dict[str, Any]) -> str:
         "### Transcript",
         transcript,
         "",
-        _fmt_dialect_markdown(record),
-        "",
         _fmt_omni_markdown(record),
+        "",
+        _fmt_dialect_markdown(record),
         "",
         "### Segment",
         f"- Podcast: {podcast or 'Unknown Podcast'}",
@@ -1361,19 +1349,25 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
         "store": None,
         "total_rows": 0,
         "eligible_rows": 0,
-        "tagged_index": None,
+        "current_row_id": None,
     }
     fixed_manifest = Path(default_manifest).expanduser()
-    tagged_manifest_path = fixed_manifest.with_name("manifest.tagged.jsonl")
+    initial_min_tag_prob = 0.5
+    initial_min_tag_duration_s = 0.2
 
-    def _row_bundle(record: dict[str, Any]):
+    def _row_bundle(
+        record: dict[str, Any], min_tag_prob: float, min_tag_duration_s: float
+    ):
         audio = str(record.get("audio_path", ""))
         if not audio or not Path(audio).exists():
             audio = None
-        tagged_index = browser.get("tagged_index")
         return (
             audio,
-            _fmt_timeline_html(record, tagged_index),
+            _fmt_timeline_html(
+                record,
+                min_tag_prob=min_tag_prob,
+                min_tag_duration_s=min_tag_duration_s,
+            ),
             _fmt_record_summary(record),
             json.dumps(record, ensure_ascii=False, indent=2),
         )
@@ -1392,9 +1386,6 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
         browser["store"] = store
         browser["total_rows"] = total
         browser["eligible_rows"] = store.total_eligible_rows
-        tagged_index = TaggedManifestIndex(tagged_manifest_path)
-        tagged_index.build()
-        browser["tagged_index"] = tagged_index
         if total == 0:
             initial_status = "Manifest is empty."
             initial_summary = "Manifest is empty."
@@ -1410,27 +1401,43 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
             )
             picked = store.random_row()
             if picked is not None:
-                _, row = picked
+                row_id, row = picked
+                browser["current_row_id"] = row_id
                 initial_audio, initial_timeline, initial_summary, initial_raw = (
-                    _row_bundle(row)
+                    _row_bundle(
+                        row, initial_min_tag_prob, initial_min_tag_duration_s
+                    )
                 )
 
     with gr.Blocks(title="Manifest Audio Browser") as app:
         gr.Markdown("## Manifest Audio Browser")
         random_btn = gr.Button("New Random Sample", variant="primary")
+        tag_prob_slider = gr.Slider(
+            minimum=0.0,
+            maximum=1.0,
+            step=0.01,
+            value=initial_min_tag_prob,
+            label="Min tag prob",
+        )
+        tag_duration_slider = gr.Slider(
+            minimum=0.0,
+            maximum=2.0,
+            step=0.05,
+            value=initial_min_tag_duration_s,
+            label="Min tag duration (s)",
+        )
 
         status_md = gr.Markdown(initial_status)
         audio_player = gr.Audio(
             label="Segment Audio",
             type="filepath",
             value=initial_audio,
-            elem_id="segment_audio_player",
         )
         timeline_md = gr.HTML(initial_timeline)
         summary_md = gr.Markdown(initial_summary)
         raw_json = gr.Code(label="Raw record JSON", language="json", value=initial_raw)
 
-        def refresh_sample():
+        def refresh_sample(min_tag_prob: float, min_tag_duration_s: float):
             store = browser.get("store")
             total_rows = int(browser.get("total_rows", 0))
             eligible_rows = int(browser.get("eligible_rows", 0))
@@ -1451,8 +1458,11 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
                     "No row selected.",
                     "",
                 )
-            _, row = picked
-            audio, timeline_html, summary, raw = _row_bundle(row)
+            row_id, row = picked
+            browser["current_row_id"] = row_id
+            audio, timeline_html, summary, raw = _row_bundle(
+                row, min_tag_prob, min_tag_duration_s
+            )
             return (
                 f"Loaded **{total_rows:,}** rows. "
                 f"Eligible (tags+emotions): **{eligible_rows:,}**.",
@@ -1462,13 +1472,33 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
                 raw,
             )
 
+        def refresh_timeline(min_tag_prob: float, min_tag_duration_s: float):
+            store = browser.get("store")
+            row_id = browser.get("current_row_id")
+            if store is None or not isinstance(row_id, int):
+                return "<div>No timeline available.</div>"
+            row = store.get_row(row_id)
+            return _fmt_timeline_html(
+                row,
+                min_tag_prob=min_tag_prob,
+                min_tag_duration_s=min_tag_duration_s,
+            )
+
         random_btn.click(
             refresh_sample,
-            inputs=[],
+            inputs=[tag_prob_slider, tag_duration_slider],
             outputs=[status_md, audio_player, timeline_md, summary_md, raw_json],
-            js=TIMELINE_SEEK_JS,
         )
-        app.load(fn=None, inputs=None, outputs=None, js=TIMELINE_SEEK_JS)
+        tag_prob_slider.change(
+            refresh_timeline,
+            inputs=[tag_prob_slider, tag_duration_slider],
+            outputs=[timeline_md],
+        )
+        tag_duration_slider.change(
+            refresh_timeline,
+            inputs=[tag_prob_slider, tag_duration_slider],
+            outputs=[timeline_md],
+        )
 
     return app
 
@@ -1519,7 +1549,6 @@ def main() -> None:
         server_port=args.port,
         share=args.share,
         allowed_paths=sorted(allowed_paths),
-        head=TIMELINE_SEEK_HEAD,
     )
 
 
