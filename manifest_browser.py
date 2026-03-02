@@ -13,9 +13,35 @@ from typing import Any
 
 import gradio as gr
 
-DEFAULT_MANIFEST = (
-    "/mnt/nas05/data02/vincenzo/podcast_data/youtube/processed/manifest_combined.jsonl"
-)
+DEFAULT_MANIFEST = "/mnt/nas05/data02/vincenzo/podcast_data/youtube/processed/manifest_combined_sample.jsonl"
+
+RAW_JSON_KEYS = [
+    "audio_path",
+    "text",
+    "start",
+    "end",
+    "duration",
+    "speaker",
+    "purity",
+    "coverage",
+    "avg_logprob",
+    "speaker_overlaps",
+    "non_main_time",
+    "avg_word_score",
+    "is_merged",
+    "merge_count",
+    "source_metrics",
+    "source_audio",
+    "source_json",
+]
+
+
+def _select_raw_json_fields(record: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key in RAW_JSON_KEYS:
+        if key in record:
+            out[key] = record[key]
+    return out
 
 
 def _extract_string_list_from_module(module_path: Path, var_name: str) -> list[str]:
@@ -129,6 +155,37 @@ DISPLAY_TAG_LABEL = {
     "<yawn>": "Yawn",
     "<gasp>": "Gasp/Breathing",
 }
+
+TAG_GROUP_LAUGHTER = "Laughter"
+TAG_GROUP_BREATHING = "Breathing"
+
+
+def _tag_group_from_raw_label(label: str) -> str | None:
+    raw = label.strip().lower()
+    if not raw:
+        return None
+
+    if raw in {
+        "laughter",
+        "baby laughter",
+        "belly laugh",
+        "snicker",
+        "chuckle, chortle",
+        "giggle",
+    }:
+        return TAG_GROUP_LAUGHTER
+
+    if raw in {
+        "gasp",
+        "pant",
+        "snort",
+        "wheeze",
+        "breathing",
+        "snoring",
+    }:
+        return TAG_GROUP_BREATHING
+
+    return None
 
 
 def _pretty_tag_label(label: str) -> str:
@@ -499,6 +556,11 @@ def _emotion_color(label: str) -> str:
 
 
 def _tag_color(label: str) -> str:
+    if label == TAG_GROUP_LAUGHTER:
+        return "#f59e0b"
+    if label == TAG_GROUP_BREATHING:
+        return "#3b82f6"
+
     canonical = _normalize_tag_label(label) or label
     fixed = {
         "<speech>": "#64748b",
@@ -636,7 +698,9 @@ def _non_speech_tag_events_from_frames(
     return final_events
 
 
-def _load_tag_events(record: dict[str, Any], min_tag_prob: float = 0.5) -> list[dict[str, Any]]:
+def _load_tag_events(
+    record: dict[str, Any], min_tag_prob: float = 0.5
+) -> list[dict[str, Any]]:
     min_tag_prob = max(0.0, min(1.0, float(min_tag_prob)))
     topk = record.get("audio_tag_topk")
     if isinstance(topk, dict):
@@ -699,7 +763,9 @@ def _load_tag_events(record: dict[str, Any], min_tag_prob: float = 0.5) -> list[
                     if not _is_speech_tag(lbl):
                         display_label, display_score = lbl, prob
                         break
-                pretty_top3 = [(_pretty_tag_label(lbl), prob) for lbl, prob in clean_top3]
+                pretty_top3 = [
+                    (_pretty_tag_label(lbl), prob) for lbl, prob in clean_top3
+                ]
                 events.append(
                     {
                         "start": round(float(i) * step, 3),
@@ -822,6 +888,185 @@ def _load_tag_events(record: dict[str, Any], min_tag_prob: float = 0.5) -> list[
         return fallback
 
     return []
+
+
+def _merge_group_events(
+    rows: list[dict[str, Any]], *, merge_gap: float = 0.05
+) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+
+    cleaned = []
+    for row in rows:
+        start = _as_float(row.get("start"))
+        end = _as_float(row.get("end"))
+        label = row.get("label")
+        score = _as_float(row.get("score"))
+        raw_top3 = row.get("raw_top3")
+        if (
+            start is None
+            or end is None
+            or not isinstance(label, str)
+            or score is None
+            or not isinstance(raw_top3, list)
+        ):
+            continue
+        if end < start:
+            start, end = end, start
+        cleaned.append(
+            {
+                "start": start,
+                "end": end,
+                "label": label,
+                "raw_label": row.get("raw_label"),
+                "score": score,
+                "raw_top3": raw_top3,
+            }
+        )
+
+    if not cleaned:
+        return []
+
+    cleaned.sort(key=lambda x: (x["start"], x["end"]))
+    merged: list[dict[str, Any]] = []
+    for row in cleaned:
+        if (
+            merged
+            and row["label"] == merged[-1]["label"]
+            and row.get("raw_label") == merged[-1].get("raw_label")
+            and row["start"] <= merged[-1]["end"] + merge_gap
+        ):
+            prev = merged[-1]
+            prev["end"] = max(prev["end"], row["end"])
+            prev["_score_sum"] = float(prev.get("_score_sum", prev["score"])) + float(
+                row["score"]
+            )
+            prev["_score_n"] = int(prev.get("_score_n", 1)) + 1
+        else:
+            merged.append(
+                {
+                    **row,
+                    "_score_sum": float(row["score"]),
+                    "_score_n": 1,
+                }
+            )
+
+    out: list[dict[str, Any]] = []
+    for row in merged:
+        n = max(1, int(row.get("_score_n", 1)))
+        avg_score = float(row.get("_score_sum", row["score"])) / n
+        out.append(
+            {
+                "start": row["start"],
+                "end": row["end"],
+                "label": row["label"],
+                "raw_label": row.get("raw_label"),
+                "score": round(avg_score, 4),
+                "raw_top3": row["raw_top3"],
+            }
+        )
+    return out
+
+
+def _group_tag_events(
+    record: dict[str, Any],
+    *,
+    min_overall_prob: float = 0.4,
+    laughter_min_prob: float = 0.0,
+    breathing_min_prob: float = 0.0,
+) -> dict[str, list[dict[str, Any]]]:
+    out: dict[str, list[dict[str, Any]]] = {
+        TAG_GROUP_LAUGHTER: [],
+        TAG_GROUP_BREATHING: [],
+    }
+
+    topk = record.get("audio_tag_topk")
+    if not isinstance(topk, dict):
+        return out
+
+    idx_rows = topk.get("top_idx")
+    prob_rows = topk.get("top_prob")
+    if not isinstance(idx_rows, list) or not isinstance(prob_rows, list):
+        return out
+
+    row_count = min(len(idx_rows), len(prob_rows))
+    duration = _as_float(record.get("duration"))
+    if duration is None or duration <= 0:
+        seg_start = _as_float(record.get("start"))
+        seg_end = _as_float(record.get("end"))
+        if seg_start is not None and seg_end is not None and seg_end > seg_start:
+            duration = seg_end - seg_start
+    if duration is None or duration <= 0:
+        duration = float(max(row_count, 1)) * 0.02
+    step = duration / float(max(row_count, 1))
+    min_overall_prob = max(0.0, min(1.0, float(min_overall_prob)))
+    laughter_min_prob = max(0.0, min(1.0, float(laughter_min_prob)))
+    breathing_min_prob = max(0.0, min(1.0, float(breathing_min_prob)))
+
+    for i in range(row_count):
+        idx_row = idx_rows[i]
+        prob_row = prob_rows[i]
+        if not isinstance(idx_row, list) or not isinstance(prob_row, list):
+            continue
+
+        best_by_group: dict[str, tuple[str, float]] = {}
+        for raw_idx, raw_prob in zip(idx_row, prob_row):
+            if not isinstance(raw_idx, int):
+                continue
+            if raw_idx < 0 or raw_idx >= len(TOPK_LABEL_VOCAB):
+                continue
+            prob = _as_float(raw_prob)
+            if prob is None:
+                continue
+            raw_label = TOPK_LABEL_VOCAB[raw_idx]
+            group = _tag_group_from_raw_label(raw_label)
+            if group is None:
+                continue
+            if group == TAG_GROUP_LAUGHTER:
+                min_needed = max(min_overall_prob, laughter_min_prob)
+            else:
+                min_needed = max(min_overall_prob, breathing_min_prob)
+            if prob < min_needed:
+                continue
+            prev = best_by_group.get(group)
+            if prev is None or prob > prev[1]:
+                best_by_group[group] = (raw_label, prob)
+
+        for group, (raw_label, prob) in best_by_group.items():
+            out[group].append(
+                {
+                    "start": round(float(i) * step, 3),
+                    "end": round(float(i + 1) * step, 3),
+                    "label": group,
+                    "raw_label": raw_label,
+                    "score": round(float(prob), 4),
+                    "raw_top3": [(raw_label, round(float(prob), 4))],
+                }
+            )
+
+    out[TAG_GROUP_LAUGHTER] = _merge_group_events(out[TAG_GROUP_LAUGHTER])
+    out[TAG_GROUP_BREATHING] = _merge_group_events(out[TAG_GROUP_BREATHING])
+    return out
+
+
+def _filter_group_events(
+    rows: list[dict[str, Any]], *, min_prob: float, min_duration_s: float
+) -> list[dict[str, Any]]:
+    min_prob = max(0.0, min(1.0, float(min_prob)))
+    min_duration_s = max(0.0, float(min_duration_s))
+    kept: list[dict[str, Any]] = []
+    for row in rows:
+        score = _as_float(row.get("score"))
+        start = _as_float(row.get("start"))
+        end = _as_float(row.get("end"))
+        if score is None or start is None or end is None:
+            continue
+        if score < min_prob:
+            continue
+        if (end - start) < min_duration_s:
+            continue
+        kept.append(row)
+    return kept
 
 
 def _svg_track_rects(
@@ -1091,14 +1336,30 @@ def _merge_adjacent_tag_rows(
 
 def _fmt_timeline_html(
     record: dict[str, Any],
-    min_tag_prob: float = 0.5,
-    min_tag_duration_s: float = 0.0,
-    tag_duration_scale: float = 1.0,
-    per_tag_overrides: dict[str, float] | None = None,
+    min_overall_prob: float = 0.4,
+    laughter_min_prob: float = 0.0,
+    laughter_min_duration_s: float = 0.0,
+    breathing_min_prob: float = 0.0,
+    breathing_min_duration_s: float = 0.0,
 ) -> str:
     emotion_timeline = _emotion_timeline(record)
-    tag_events = _load_tag_events(record, min_tag_prob=min_tag_prob)
-    total = _segment_duration(record, [emotion_timeline, tag_events])
+    grouped_tag_events = _group_tag_events(
+        record,
+        min_overall_prob=min_overall_prob,
+        laughter_min_prob=laughter_min_prob,
+        breathing_min_prob=breathing_min_prob,
+    )
+    laughter_rows = _filter_group_events(
+        grouped_tag_events.get(TAG_GROUP_LAUGHTER, []),
+        min_prob=laughter_min_prob,
+        min_duration_s=laughter_min_duration_s,
+    )
+    breathing_rows = _filter_group_events(
+        grouped_tag_events.get(TAG_GROUP_BREATHING, []),
+        min_prob=breathing_min_prob,
+        min_duration_s=breathing_min_duration_s,
+    )
+    total = _segment_duration(record, [emotion_timeline, laughter_rows, breathing_rows])
     if total <= 0:
         total = 1.0
 
@@ -1120,37 +1381,15 @@ def _fmt_timeline_html(
     else:
         overall_html = "<b>Overall sentence emotion:</b> not available yet"
 
-    tag_rank1 = _tag_rank_rows(
-        tag_events,
-        0,
-        min_duration_s=min_tag_duration_s,
-        per_tag_scale=tag_duration_scale,
-        per_tag_overrides=per_tag_overrides,
-    )
-    tag_rank2 = _tag_rank_rows(
-        tag_events,
-        1,
-        min_duration_s=min_tag_duration_s,
-        per_tag_scale=tag_duration_scale,
-        per_tag_overrides=per_tag_overrides,
-    )
-    tag_rank3 = _tag_rank_rows(
-        tag_events,
-        2,
-        min_duration_s=min_tag_duration_s,
-        per_tag_scale=tag_duration_scale,
-        per_tag_overrides=per_tag_overrides,
-    )
     container_id = f"mb-{random.randrange(1_000_000_000):x}"
 
     svg_w = 1000.0
-    svg_h = 208.0
+    svg_h = 166.0
     x0 = 0.0
     xw = 1000.0
     emo_y = 30.0
     tag1_y = 72.0
     tag2_y = 114.0
-    tag3_y = 156.0
     track_h = 22.0
 
     emotion_rects, emotion_hover = _svg_track_rects(
@@ -1165,36 +1404,27 @@ def _fmt_timeline_html(
         squish_px=0.0,
     )
     tag1_rects, tag1_hover = _svg_track_rects(
-        tag_rank1,
+        laughter_rows,
         total=total,
         y=tag1_y,
         height=track_h,
         x0=x0,
         width=xw,
         color_fn=_tag_color,
-        lane_name="Tag #1",
+        lane_name=TAG_GROUP_LAUGHTER,
+        show_label=False,
         squish_px=2.2,
     )
     tag2_rects, tag2_hover = _svg_track_rects(
-        tag_rank2,
+        breathing_rows,
         total=total,
         y=tag2_y,
         height=track_h,
         x0=x0,
         width=xw,
         color_fn=_tag_color,
-        lane_name="Tag #2",
-        squish_px=2.2,
-    )
-    tag3_rects, tag3_hover = _svg_track_rects(
-        tag_rank3,
-        total=total,
-        y=tag3_y,
-        height=track_h,
-        x0=x0,
-        width=xw,
-        color_fn=_tag_color,
-        lane_name="Tag #3",
+        lane_name=TAG_GROUP_BREATHING,
+        show_label=False,
         squish_px=2.2,
     )
     return f"""
@@ -1395,19 +1625,15 @@ def _fmt_timeline_html(
       <rect class="mb-svg-bg" x="{x0:.2f}" y="{emo_y:.2f}" width="{xw:.2f}" height="{track_h:.2f}" rx="4"></rect>
       <rect class="mb-svg-bg" x="{x0:.2f}" y="{tag1_y:.2f}" width="{xw:.2f}" height="{track_h:.2f}" rx="4"></rect>
       <rect class="mb-svg-bg" x="{x0:.2f}" y="{tag2_y:.2f}" width="{xw:.2f}" height="{track_h:.2f}" rx="4"></rect>
-      <rect class="mb-svg-bg" x="{x0:.2f}" y="{tag3_y:.2f}" width="{xw:.2f}" height="{track_h:.2f}" rx="4"></rect>
       <text class="mb-lane-label" x="{x0 + 6:.1f}" y="{emo_y + track_h - 6:.1f}" font-size="10" font-weight="700">Emotion</text>
-      <text class="mb-lane-label" x="{x0 + 6:.1f}" y="{tag1_y + track_h - 6:.1f}" font-size="10" font-weight="700">Tag #1</text>
-      <text class="mb-lane-label" x="{x0 + 6:.1f}" y="{tag2_y + track_h - 6:.1f}" font-size="10" font-weight="700">Tag #2</text>
-      <text class="mb-lane-label" x="{x0 + 6:.1f}" y="{tag3_y + track_h - 6:.1f}" font-size="10" font-weight="700">Tag #3</text>
+      <text class="mb-lane-label" x="{x0 + 6:.1f}" y="{tag1_y + track_h - 6:.1f}" font-size="10" font-weight="700">{TAG_GROUP_LAUGHTER}</text>
+      <text class="mb-lane-label" x="{x0 + 6:.1f}" y="{tag2_y + track_h - 6:.1f}" font-size="10" font-weight="700">{TAG_GROUP_BREATHING}</text>
       {emotion_rects}
       {tag1_rects}
       {tag2_rects}
-      {tag3_rects}
       {emotion_hover}
       {tag1_hover}
       {tag2_hover}
-      {tag3_hover}
     </svg>
   </div>
 </div>
@@ -1475,17 +1701,19 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
         "current_row_id": None,
     }
     fixed_manifest = Path(default_manifest).expanduser()
-    initial_min_tag_prob = 0.5
-    initial_min_tag_duration_s = 0.0
-    initial_tag_duration_scale = 1.0
-    slider_tag_keys = [k for k, _ in AGG_TAG_SLIDERS]
+    initial_min_overall_prob = 0.4
+    initial_laughter_min_prob = 0.0
+    initial_laughter_min_duration_s = 0.0
+    initial_breathing_min_prob = 0.0
+    initial_breathing_min_duration_s = 0.0
 
     def _row_bundle(
         record: dict[str, Any],
-        min_tag_prob: float,
-        min_tag_duration_s: float,
-        tag_duration_scale: float,
-        per_tag_overrides: dict[str, float],
+        min_overall_prob: float,
+        laughter_min_prob: float,
+        laughter_min_duration_s: float,
+        breathing_min_prob: float,
+        breathing_min_duration_s: float,
     ):
         audio = str(record.get("audio_path", ""))
         if not audio or not Path(audio).exists():
@@ -1494,13 +1722,14 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
             audio,
             _fmt_timeline_html(
                 record,
-                min_tag_prob=min_tag_prob,
-                min_tag_duration_s=min_tag_duration_s,
-                tag_duration_scale=tag_duration_scale,
-                per_tag_overrides=per_tag_overrides,
+                min_overall_prob=min_overall_prob,
+                laughter_min_prob=laughter_min_prob,
+                laughter_min_duration_s=laughter_min_duration_s,
+                breathing_min_prob=breathing_min_prob,
+                breathing_min_duration_s=breathing_min_duration_s,
             ),
             _fmt_record_summary(record),
-            json.dumps(record, ensure_ascii=False, indent=2),
+            json.dumps(_select_raw_json_fields(record), ensure_ascii=False, indent=2),
         )
 
     initial_status = ""
@@ -1537,61 +1766,55 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
                 initial_audio, initial_timeline, initial_summary, initial_raw = (
                     _row_bundle(
                         row,
-                        initial_min_tag_prob,
-                        initial_min_tag_duration_s,
-                        initial_tag_duration_scale,
-                        {},
+                        initial_min_overall_prob,
+                        initial_laughter_min_prob,
+                        initial_laughter_min_duration_s,
+                        initial_breathing_min_prob,
+                        initial_breathing_min_duration_s,
                     )
                 )
 
     with gr.Blocks(title="Manifest Audio Browser") as app:
         gr.Markdown("## Manifest Audio Browser")
         random_btn = gr.Button("New Random Sample", variant="primary")
-        tag_prob_slider = gr.Slider(
+        min_overall_prob_slider = gr.Slider(
             minimum=0.0,
             maximum=1.0,
             step=0.01,
-            value=initial_min_tag_prob,
-            label="Min tag prob",
+            value=initial_min_overall_prob,
+            label="Global min logits/prob (applies to all tags)",
         )
-        tag_duration_slider = gr.Slider(
-            minimum=0.0,
-            maximum=2.0,
-            step=0.05,
-            value=initial_min_tag_duration_s,
-            label="Min tag duration floor (s)",
-        )
-        tag_duration_scale_slider = gr.Slider(
-            minimum=0.5,
-            maximum=2.0,
-            step=0.05,
-            value=initial_tag_duration_scale,
-            label="Per-tag duration scale",
-        )
-        gr.Markdown("### Per-tag Min Duration (s)")
-        per_tag_sliders: dict[str, gr.Slider] = {}
-        split = (len(slider_tag_keys) + 1) // 2
-        left_items = AGG_TAG_SLIDERS[:split]
-        right_items = AGG_TAG_SLIDERS[split:]
         with gr.Row():
             with gr.Column():
-                for key, label in left_items:
-                    per_tag_sliders[key] = gr.Slider(
-                        minimum=0.0,
-                        maximum=1.0,
-                        step=0.01,
-                        value=float(DEFAULT_TAG_MIN_DURATION_S.get(key, 0.15)),
-                        label=label,
-                    )
+                laughter_prob_slider = gr.Slider(
+                    minimum=0.0,
+                    maximum=1.0,
+                    step=0.01,
+                    value=initial_laughter_min_prob,
+                    label="Laughter min logits/prob",
+                )
+                laughter_duration_slider = gr.Slider(
+                    minimum=0.0,
+                    maximum=6.0,
+                    step=0.05,
+                    value=initial_laughter_min_duration_s,
+                    label="Laughter min duration (s)",
+                )
             with gr.Column():
-                for key, label in right_items:
-                    per_tag_sliders[key] = gr.Slider(
-                        minimum=0.0,
-                        maximum=1.0,
-                        step=0.01,
-                        value=float(DEFAULT_TAG_MIN_DURATION_S.get(key, 0.15)),
-                        label=label,
-                    )
+                breathing_prob_slider = gr.Slider(
+                    minimum=0.0,
+                    maximum=1.0,
+                    step=0.01,
+                    value=initial_breathing_min_prob,
+                    label="Breathing min logits/prob",
+                )
+                breathing_duration_slider = gr.Slider(
+                    minimum=0.0,
+                    maximum=2.0,
+                    step=0.05,
+                    value=initial_breathing_min_duration_s,
+                    label="Breathing min duration (s)",
+                )
 
         status_md = gr.Markdown(initial_status)
         audio_player = gr.Audio(
@@ -1602,22 +1825,13 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
         timeline_md = gr.HTML(initial_timeline)
         summary_md = gr.Markdown(initial_summary)
         raw_json = gr.Code(label="Raw record JSON", language="json", value=initial_raw)
-        per_tag_input_components = [per_tag_sliders[k] for k in slider_tag_keys]
-
-        def _build_overrides(values: tuple[float, ...]) -> dict[str, float]:
-            overrides: dict[str, float] = {}
-            for key, value in zip(slider_tag_keys, values):
-                try:
-                    overrides[key] = max(0.0, float(value))
-                except Exception:
-                    continue
-            return overrides
 
         def refresh_sample(
-            min_tag_prob: float,
-            min_tag_duration_s: float,
-            tag_duration_scale: float,
-            *tag_values: float,
+            min_overall_prob: float,
+            laughter_min_prob: float,
+            laughter_min_duration_s: float,
+            breathing_min_prob: float,
+            breathing_min_duration_s: float,
         ):
             store = browser.get("store")
             total_rows = int(browser.get("total_rows", 0))
@@ -1641,13 +1855,13 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
                 )
             row_id, row = picked
             browser["current_row_id"] = row_id
-            overrides = _build_overrides(tuple(tag_values))
             audio, timeline_html, summary, raw = _row_bundle(
                 row,
-                min_tag_prob,
-                min_tag_duration_s,
-                tag_duration_scale,
-                overrides,
+                min_overall_prob,
+                laughter_min_prob,
+                laughter_min_duration_s,
+                breathing_min_prob,
+                breathing_min_duration_s,
             )
             return (
                 f"Loaded **{total_rows:,}** rows. "
@@ -1659,76 +1873,92 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
             )
 
         def refresh_timeline(
-            min_tag_prob: float,
-            min_tag_duration_s: float,
-            tag_duration_scale: float,
-            *tag_values: float,
+            min_overall_prob: float,
+            laughter_min_prob: float,
+            laughter_min_duration_s: float,
+            breathing_min_prob: float,
+            breathing_min_duration_s: float,
         ):
             store = browser.get("store")
             row_id = browser.get("current_row_id")
             if store is None or not isinstance(row_id, int):
                 return "<div>No timeline available.</div>"
             row = store.get_row(row_id)
-            overrides = _build_overrides(tuple(tag_values))
             return _fmt_timeline_html(
                 row,
-                min_tag_prob=min_tag_prob,
-                min_tag_duration_s=min_tag_duration_s,
-                tag_duration_scale=tag_duration_scale,
-                per_tag_overrides=overrides,
+                min_overall_prob=min_overall_prob,
+                laughter_min_prob=laughter_min_prob,
+                laughter_min_duration_s=laughter_min_duration_s,
+                breathing_min_prob=breathing_min_prob,
+                breathing_min_duration_s=breathing_min_duration_s,
             )
 
         random_btn.click(
             refresh_sample,
             inputs=[
-                tag_prob_slider,
-                tag_duration_slider,
-                tag_duration_scale_slider,
-                *per_tag_input_components,
+                min_overall_prob_slider,
+                laughter_prob_slider,
+                laughter_duration_slider,
+                breathing_prob_slider,
+                breathing_duration_slider,
             ],
             outputs=[status_md, audio_player, timeline_md, summary_md, raw_json],
         )
-        tag_prob_slider.change(
+        min_overall_prob_slider.change(
             refresh_timeline,
             inputs=[
-                tag_prob_slider,
-                tag_duration_slider,
-                tag_duration_scale_slider,
-                *per_tag_input_components,
+                min_overall_prob_slider,
+                laughter_prob_slider,
+                laughter_duration_slider,
+                breathing_prob_slider,
+                breathing_duration_slider,
             ],
             outputs=[timeline_md],
         )
-        tag_duration_slider.change(
+        laughter_prob_slider.change(
             refresh_timeline,
             inputs=[
-                tag_prob_slider,
-                tag_duration_slider,
-                tag_duration_scale_slider,
-                *per_tag_input_components,
+                min_overall_prob_slider,
+                laughter_prob_slider,
+                laughter_duration_slider,
+                breathing_prob_slider,
+                breathing_duration_slider,
             ],
             outputs=[timeline_md],
         )
-        tag_duration_scale_slider.change(
+        laughter_duration_slider.change(
             refresh_timeline,
             inputs=[
-                tag_prob_slider,
-                tag_duration_slider,
-                tag_duration_scale_slider,
-                *per_tag_input_components,
+                min_overall_prob_slider,
+                laughter_prob_slider,
+                laughter_duration_slider,
+                breathing_prob_slider,
+                breathing_duration_slider,
             ],
             outputs=[timeline_md],
         )
-        for slider in per_tag_input_components:
-            slider.change(
-                refresh_timeline,
-                inputs=[
-                    tag_prob_slider,
-                    tag_duration_slider,
-                    tag_duration_scale_slider,
-                    *per_tag_input_components,
-                ],
-                outputs=[timeline_md],
-            )
+        breathing_prob_slider.change(
+            refresh_timeline,
+            inputs=[
+                min_overall_prob_slider,
+                laughter_prob_slider,
+                laughter_duration_slider,
+                breathing_prob_slider,
+                breathing_duration_slider,
+            ],
+            outputs=[timeline_md],
+        )
+        breathing_duration_slider.change(
+            refresh_timeline,
+            inputs=[
+                min_overall_prob_slider,
+                laughter_prob_slider,
+                laughter_duration_slider,
+                breathing_prob_slider,
+                breathing_duration_slider,
+            ],
+            outputs=[timeline_md],
+        )
 
     return app
 

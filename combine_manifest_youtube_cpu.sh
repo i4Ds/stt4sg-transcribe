@@ -36,7 +36,7 @@ ROOT_DIR="/mnt/nas05/data02/vincenzo/podcast_data/youtube/processed"
 MANIFEST="${ROOT_DIR}/manifest.jsonl"
 EMOTION="${ROOT_DIR}/manifest.emotion.jsonl"
 OMNI="${ROOT_DIR}/manifest.omni.all.mixed50.ctx.zs.jsonl"
-DIALECT="${ROOT_DIR}/manifest_speaker_dialects.jsonl"
+DIALECT="${ROOT_DIR}/manifest_with_speaker_dialect.jsonl"
 TAGGED="${ROOT_DIR}/manifest.tagged.sed.h200.v2.fullclip.jsonl"
 OUT="${ROOT_DIR}/manifest_combined.jsonl"
 
