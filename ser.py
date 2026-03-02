@@ -545,6 +545,10 @@ def main() -> int:
         trust_remote_code=True,
         cache_dir=cache_dir,
         local_files_only=args.local_files_only,
+        # MERaLiON remote code builds Python ints during __init__, which breaks
+        # when transformers uses meta-tensor init (common with accelerate hooks).
+        low_cpu_mem_usage=False,
+        device_map=None,
     ).to(device)
     model.eval()
     round_digits = None if args.round < 0 else args.round
