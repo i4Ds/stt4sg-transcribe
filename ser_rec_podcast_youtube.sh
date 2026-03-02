@@ -2,9 +2,9 @@
 #SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --job-name ser_youtube
-#SBATCH --mem=32G
-#SBATCH --gres=gpu:rtx3080
-#SBATCH --partition=top6
+#SBATCH --mem=64G
+#SBATCH --gres=gpu:1
+#SBATCH --partition=h200
 #SBATCH --nodes=1
 #SBATCH --out=logs/ser_youtube_%j.out
 #SBATCH --error=logs/ser_youtube_%j.err
@@ -45,6 +45,6 @@ ser_output="${dir}/manifest.emotion.jsonl"
 echo "SER: ${manifest}"
 python ser.py "${manifest}" \
     --output "${ser_output}" \
-    --batch-size 16 \
+    --batch-size 1024 \
     --min-seconds 0.2 \
     --slim-output

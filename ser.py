@@ -534,7 +534,10 @@ def main() -> int:
     cache_dir = str(args.cache_dir) if args.cache_dir else None
     logger.info("Loading SER processor: %s", args.repo)
     processor = AutoProcessor.from_pretrained(
-        args.repo, cache_dir=cache_dir, local_files_only=args.local_files_only
+        args.repo,
+        cache_dir=cache_dir,
+        local_files_only=args.local_files_only,
+        trust_remote_code=True,
     )
     logger.info("Loading SER model: %s", args.repo)
     model = AutoModelForAudioClassification.from_pretrained(

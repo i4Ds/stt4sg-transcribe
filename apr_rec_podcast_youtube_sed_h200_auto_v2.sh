@@ -38,7 +38,6 @@ MANIFEST="${ROOT_DIR}/manifest.jsonl"
 OUT="${ROOT_DIR}/manifest.tagged.sed.h200.v2.fullclip.jsonl"
 
 [ -f "${MANIFEST}" ] || { echo "Manifest not found: ${MANIFEST}"; exit 1; }
-[ ! -f "${OUT}" ] || { echo "Refusing to overwrite existing output: ${OUT}"; exit 1; }
 
 echo "== Running SED APR v2 on full manifest (full-clip inference) =="
 
