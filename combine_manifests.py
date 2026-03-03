@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strict manifest combiner (fail-fast).
+"""Manifest combiner.
 
 Joins by audio_path and writes only:
 - emotion_frames
@@ -10,12 +10,14 @@ Joins by audio_path and writes only:
 - dialect_speaker_majority
 - dialect_speaker_majority_name
 
-Any missing key/mapping raises and stops the run.
+Default mode: strict fail-fast.
+Optional mode: skip incomplete rows and write a CSV report.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 from typing import Any
@@ -34,6 +36,17 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("manifest_combined.jsonl"),
         help="Output JSONL path (default: manifest_combined.jsonl)",
+    )
+    parser.add_argument(
+        "--skip-incomplete",
+        action="store_true",
+        help="Skip rows with missing data instead of failing.",
+    )
+    parser.add_argument(
+        "--missing-report-csv",
+        type=Path,
+        default=Path("manifest_combined_missing.csv"),
+        help="CSV report path for skipped rows (used with --skip-incomplete).",
     )
     return parser.parse_args()
 
@@ -59,6 +72,12 @@ def resolve_output_path(manifest_path: Path, output_arg: Path) -> Path:
     return manifest_path.parent / output_arg
 
 
+def resolve_report_path(manifest_path: Path, report_arg: Path) -> Path:
+    if report_arg.is_absolute():
+        return report_arg
+    return manifest_path.parent / report_arg
+
+
 def build_emotion_index(path: Path) -> dict[str, list[Any]]:
     out: dict[str, list[Any]] = {}
     for row in read_jsonl(path):
@@ -78,6 +97,28 @@ def build_tag_index(path: Path) -> dict[str, dict[str, Any]]:
     for row in read_jsonl(path):
         out[row["audio_path"]] = row["audio_tag_topk"]
     return out
+
+
+def _is_present(value: Any) -> bool:
+    return value is not None
+
+
+def _missing_csv_row(
+    *,
+    line_num: int,
+    audio_path: str,
+    source_audio: str,
+    speaker: str,
+    missing: list[str],
+) -> dict[str, str]:
+    return {
+        "manifest_line": str(line_num),
+        "audio_path": audio_path,
+        "source_audio": source_audio,
+        "speaker": speaker,
+        "missing_count": str(len(missing)),
+        "missing_fields": ";".join(missing),
+    }
 
 
 def build_dialect_indexes(
@@ -123,8 +164,13 @@ def main() -> int:
 
     output_path = resolve_output_path(args.manifest, args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path = resolve_report_path(args.manifest, args.missing_report_csv)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
 
     rows = 0
+    written_rows = 0
+    skipped_rows = 0
+    skipped_report: list[dict[str, str]] = []
     with args.manifest.open("r", encoding="utf-8") as infile, output_path.open(
         "w", encoding="utf-8"
     ) as out:
@@ -145,20 +191,102 @@ def main() -> int:
             rows += 1
             merged = dict(row)
             akey = merged["audio_path"]
+            missing: list[str] = []
 
-            merged["emotion_frames"] = emotion_by_audio[akey]
-            merged["omni_text"] = omni_by_audio[akey]
-            merged["audio_tag_topk"] = tags_by_audio[akey]
+            emotion_val = emotion_by_audio.get(akey)
+            if not _is_present(emotion_val):
+                missing.append("emotion_frames")
+            else:
+                merged["emotion_frames"] = emotion_val
 
-            try:
-                merged.update(dialect_by_audio[akey])
-            except KeyError:
-                merged.update(dialect_by_source_speaker[(merged["source_audio"], merged["speaker"])])
+            omni_val = omni_by_audio.get(akey)
+            if not _is_present(omni_val):
+                missing.append("omni_text")
+            else:
+                merged["omni_text"] = omni_val
+
+            tags_val = tags_by_audio.get(akey)
+            if not _is_present(tags_val):
+                missing.append("audio_tag_topk")
+            else:
+                merged["audio_tag_topk"] = tags_val
+
+            dialect_payload = dialect_by_audio.get(akey)
+            if dialect_payload is None:
+                source_audio = merged.get("source_audio")
+                speaker = merged.get("speaker")
+                if _is_present(source_audio) and _is_present(speaker):
+                    dialect_payload = dialect_by_source_speaker.get((source_audio, speaker))
+                else:
+                    if not _is_present(source_audio):
+                        missing.append("source_audio")
+                    if not _is_present(speaker):
+                        missing.append("speaker")
+
+            if dialect_payload is None:
+                missing.extend(
+                    [
+                        "dialect_segment",
+                        "dialect_segment_name",
+                        "dialect_speaker_majority",
+                        "dialect_speaker_majority_name",
+                    ]
+                )
+            else:
+                for key in (
+                    "dialect_segment",
+                    "dialect_segment_name",
+                    "dialect_speaker_majority",
+                    "dialect_speaker_majority_name",
+                ):
+                    value = dialect_payload.get(key)
+                    if not _is_present(value):
+                        missing.append(key)
+                    else:
+                        merged[key] = value
+
+            if missing:
+                if not args.skip_incomplete:
+                    raise KeyError(
+                        f"Missing data for audio_path='{akey}' at manifest line {line_num}: {', '.join(missing)}"
+                    )
+                skipped_rows += 1
+                skipped_report.append(
+                    _missing_csv_row(
+                        line_num=line_num,
+                        audio_path=str(akey),
+                        source_audio=str(merged.get("source_audio", "")),
+                        speaker=str(merged.get("speaker", "")),
+                        missing=missing,
+                    )
+                )
+                continue
 
             out.write(json.dumps(merged, ensure_ascii=False) + "\n")
+            written_rows += 1
+
+    if args.skip_incomplete:
+        with report_path.open("w", encoding="utf-8", newline="") as rep:
+            writer = csv.DictWriter(
+                rep,
+                fieldnames=[
+                    "manifest_line",
+                    "audio_path",
+                    "source_audio",
+                    "speaker",
+                    "missing_count",
+                    "missing_fields",
+                ],
+            )
+            writer.writeheader()
+            for record in skipped_report:
+                writer.writerow(record)
+        print(f"Missing report CSV: {report_path}")
+        print(f"Rows skipped (incomplete): {skipped_rows}")
 
     print(f"Wrote: {output_path}")
     print(f"Rows processed: {rows}")
+    print(f"Rows written: {written_rows}")
     return 0
 
 

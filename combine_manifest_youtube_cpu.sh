@@ -39,6 +39,7 @@ OMNI="${ROOT_DIR}/manifest.omni.all.mixed50.ctx.zs.jsonl"
 DIALECT="${ROOT_DIR}/manifest_with_speaker_dialect.jsonl"
 TAGGED="${ROOT_DIR}/manifest.tagged.sed.h200.v2.fullclip.jsonl"
 OUT="${ROOT_DIR}/manifest_combined.jsonl"
+MISSING_CSV="${ROOT_DIR}/manifest_combined_missing.csv"
 
 [ -f "${MANIFEST}" ] || { echo "Missing file: ${MANIFEST}"; exit 1; }
 [ -f "${EMOTION}" ] || { echo "Missing file: ${EMOTION}"; exit 1; }
@@ -54,6 +55,9 @@ python combine_manifests.py \
     "${OMNI}" \
     "${DIALECT}" \
     "${TAGGED}" \
-    --output "${OUT}"
+    --output "${OUT}" \
+    --skip-incomplete \
+    --missing-report-csv "${MISSING_CSV}"
 
 echo "Done. Output: ${OUT}"
+echo "Missing report: ${MISSING_CSV}"

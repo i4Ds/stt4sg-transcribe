@@ -151,6 +151,87 @@ def _collect_audio_keys(entry: Dict, base_dir: Path) -> List[str]:
     return keys
 
 
+def _entry_has_non_null_topk(entry: Dict) -> bool:
+    if isinstance(entry.get("final_segments"), list):
+        segments = entry["final_segments"]
+    elif isinstance(entry.get("segments"), list):
+        segments = entry["segments"]
+    else:
+        return entry.get("audio_tag_topk") is not None
+
+    if not segments:
+        return False
+    return all(segment.get("audio_tag_topk") is not None for segment in segments)
+
+
+def _collect_processed_non_null_audio_keys(entry: Dict, base_dir: Path) -> List[str]:
+    keys: List[str] = []
+    seen = set()
+
+    if isinstance(entry.get("final_segments"), list):
+        segments = entry["final_segments"]
+    elif isinstance(entry.get("segments"), list):
+        segments = entry["segments"]
+    else:
+        segments = None
+
+    if segments is None:
+        if entry.get("audio_tag_topk") is None:
+            return keys
+        for key in _collect_audio_keys(entry, base_dir):
+            if key in seen:
+                continue
+            seen.add(key)
+            keys.append(key)
+        return keys
+
+    for segment in segments:
+        if segment.get("audio_tag_topk") is None:
+            continue
+        resolved = _resolve_audio_path(entry, segment, base_dir)
+        if resolved is None:
+            continue
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+    return keys
+
+
+def _build_minimal_output_row(tagged: Dict) -> Dict[str, object]:
+    topk = tagged.get("audio_tag_topk")
+    source = tagged.get("audio_tags_source")
+    if topk is None:
+        raise RuntimeError(
+            "Cannot write --minimal-output row with null top-level audio_tag_topk. "
+            "Entry likely has segment-level tags only."
+        )
+
+    slim: Dict[str, object] = {
+        "audio_path": tagged.get("audio_path")
+        or tagged.get("audio_filepath")
+        or tagged.get("path")
+        or tagged.get("audio"),
+        "text": tagged.get("text"),
+        "audio_tags_source": source,
+        "audio_tag_topk": topk,
+    }
+    if "audio_tag_frames_raw" in tagged:
+        slim["audio_tag_frames_raw"] = tagged.get("audio_tag_frames_raw")
+    return slim
+
+
+def _entry_ref(entry: Dict) -> str:
+    return str(
+        entry.get("audio_path")
+        or entry.get("audio_filepath")
+        or entry.get("path")
+        or entry.get("audio")
+        or "<unknown-audio>"
+    )
+
+
 def _load_processed_audio_keys(output_path: Path, base_dir: Path) -> set[str]:
     processed: set[str] = set()
     if not output_path.exists():
@@ -164,11 +245,14 @@ def _load_processed_audio_keys(output_path: Path, base_dir: Path) -> set[str]:
             try:
                 entry = json.loads(stripped)
             except json.JSONDecodeError as exc:
-                logger.warning(
-                    "Ignoring output line %d: JSON decode error: %s", line_num, exc
+                logger.error(
+                    "Invalid JSON in existing output %s at line %d: %s",
+                    output_path,
+                    line_num,
+                    exc,
                 )
                 continue
-            for key in _collect_audio_keys(entry, base_dir):
+            for key in _collect_processed_non_null_audio_keys(entry, base_dir):
                 processed.add(key)
     return processed
 
@@ -603,8 +687,10 @@ def _tag_entry_batch(
             segments = [entry]
         for segment in segments:
             audio_path = _resolve_audio_path(entry, segment, base_dir)
-            if audio_path is None or not audio_path.exists():
-                continue
+            if audio_path is None:
+                raise ValueError(f"No audio path found for entry: {entry}")
+            if not audio_path.exists():
+                raise FileNotFoundError(f"Audio file not found: {audio_path}")
             cache = audio_cache if cache_audio else {}
             audio, sr = _load_audio(audio_path, target_sr=sample_rate, cache=cache)
             tasks.append({"segment": segment, "audio": audio, "sr": sr})
@@ -673,11 +759,9 @@ def _tag_entry(
     for segment in segments:
         audio_path = _resolve_audio_path(entry, segment, base_dir)
         if audio_path is None:
-            logger.warning("No audio path found for entry; skipping tagging.")
-            continue
+            raise ValueError(f"No audio path found for entry: {entry}")
         if not audio_path.exists():
-            logger.warning("Audio file not found: %s", audio_path)
-            continue
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
         cache = audio_cache if cache_audio else {}
         audio, sr = _load_audio(audio_path, target_sr=sample_rate, cache=cache)
         segment.update(
@@ -712,7 +796,13 @@ def _iter_jsonl(path: Path) -> Iterable[Tuple[int, Dict]]:
             try:
                 yield line_num, json.loads(stripped)
             except json.JSONDecodeError as exc:
-                logger.warning("Skipping line %d: JSON decode error: %s", line_num, exc)
+                logger.error(
+                    "Invalid JSON in manifest %s at line %d: %s",
+                    path,
+                    line_num,
+                    exc,
+                )
+                continue
 
 
 def main() -> int:
@@ -821,7 +911,84 @@ def main() -> int:
     audio_cache: Dict[Path, Tuple[np.ndarray, int]] = {}
 
     pending_entries: List[Dict] = []
-    pending_keys: List[List[str]] = []
+    failed_entries = 0
+    written_entries = 0
+
+    def _write_tagged_entry(tagged: Dict) -> None:
+        nonlocal written_entries
+        if not _entry_has_non_null_topk(tagged):
+            raise RuntimeError(
+                f"Tagging returned null audio_tag_topk for entry: {_entry_ref(tagged)}"
+            )
+        if args.minimal_output:
+            slim = _build_minimal_output_row(tagged)
+            outfile.write(json.dumps(slim, ensure_ascii=False) + "\n")
+        else:
+            outfile.write(json.dumps(tagged, ensure_ascii=False) + "\n")
+        processed_audio_keys.update(
+            _collect_processed_non_null_audio_keys(tagged, base_dir)
+        )
+        written_entries += 1
+
+    def _flush_pending(entries: List[Dict]) -> None:
+        nonlocal failed_entries
+        if not entries:
+            return
+        try:
+            tagged_batch = _tag_entry_batch(
+                entries=entries,
+                model=model,
+                label_indices=label_indices,
+                label_names=label_names,
+                classes=classes,
+                base_dir=base_dir,
+                sample_rate=args.sample_rate,
+                round_digits=round_digits,
+                save_raw_frames=args.save_raw_frames,
+                raw_top_k=args.raw_top_k,
+                top_k=args.top_k,
+                min_prob=args.min_prob,
+                batch_size=args.batch_size,
+                cache_audio=not args.no_cache,
+                audio_cache=audio_cache,
+                device=device,
+            )
+            for tagged in tagged_batch:
+                try:
+                    _write_tagged_entry(tagged)
+                except Exception:
+                    failed_entries += 1
+                    logger.exception("Failed to write tagged entry: %s", _entry_ref(tagged))
+            return
+        except Exception:
+            logger.exception(
+                "Batch tagging failed for %d entries. Falling back to per-entry tagging.",
+                len(entries),
+            )
+
+        for entry in entries:
+            try:
+                tagged = _tag_entry(
+                    entry=entry,
+                    model=model,
+                    label_indices=label_indices,
+                    label_names=label_names,
+                    classes=classes,
+                    base_dir=base_dir,
+                    sample_rate=args.sample_rate,
+                    round_digits=round_digits,
+                    save_raw_frames=args.save_raw_frames,
+                    raw_top_k=args.raw_top_k,
+                    top_k=args.top_k,
+                    min_prob=args.min_prob,
+                    cache_audio=not args.no_cache,
+                    audio_cache=audio_cache,
+                    device=device,
+                )
+                _write_tagged_entry(tagged)
+            except Exception:
+                failed_entries += 1
+                logger.exception("Failed to tag entry: %s", _entry_ref(entry))
 
     with open(output_path, "a", encoding="utf-8") as outfile:
         for _, entry in _iter_jsonl(args.manifest):
@@ -829,86 +996,20 @@ def main() -> int:
             if entry_audio_keys and all(key in processed_audio_keys for key in entry_audio_keys):
                 continue
             pending_entries.append(entry)
-            pending_keys.append(entry_audio_keys)
             if len(pending_entries) < args.batch_size:
                 continue
-
-            tagged_batch = _tag_entry_batch(
-                entries=pending_entries,
-                model=model,
-                label_indices=label_indices,
-                label_names=label_names,
-                classes=classes,
-                base_dir=base_dir,
-                sample_rate=args.sample_rate,
-                round_digits=round_digits,
-                save_raw_frames=args.save_raw_frames,
-                raw_top_k=args.raw_top_k,
-                top_k=args.top_k,
-                min_prob=args.min_prob,
-                batch_size=args.batch_size,
-                cache_audio=not args.no_cache,
-                audio_cache=audio_cache,
-                device=device,
-            )
-            for tagged, entry_audio_keys in zip(tagged_batch, pending_keys):
-                if args.minimal_output:
-                    slim = {
-                        "audio_path": tagged.get("audio_path")
-                        or tagged.get("audio_filepath")
-                        or tagged.get("path")
-                        or tagged.get("audio"),
-                        "text": tagged.get("text"),
-                        "audio_tags_source": tagged.get("audio_tags_source"),
-                        "audio_tag_topk": tagged.get("audio_tag_topk"),
-                    }
-                    if "audio_tag_frames_raw" in tagged:
-                        slim["audio_tag_frames_raw"] = tagged.get("audio_tag_frames_raw")
-                    outfile.write(json.dumps(slim, ensure_ascii=False) + "\n")
-                else:
-                    outfile.write(json.dumps(tagged, ensure_ascii=False) + "\n")
-                processed_audio_keys.update(entry_audio_keys)
+            _flush_pending(pending_entries)
             pending_entries = []
-            pending_keys = []
 
         if pending_entries:
-            tagged_batch = _tag_entry_batch(
-                entries=pending_entries,
-                model=model,
-                label_indices=label_indices,
-                label_names=label_names,
-                classes=classes,
-                base_dir=base_dir,
-                sample_rate=args.sample_rate,
-                round_digits=round_digits,
-                save_raw_frames=args.save_raw_frames,
-                raw_top_k=args.raw_top_k,
-                top_k=args.top_k,
-                min_prob=args.min_prob,
-                batch_size=args.batch_size,
-                cache_audio=not args.no_cache,
-                audio_cache=audio_cache,
-                device=device,
-            )
-            for tagged, entry_audio_keys in zip(tagged_batch, pending_keys):
-                if args.minimal_output:
-                    slim = {
-                        "audio_path": tagged.get("audio_path")
-                        or tagged.get("audio_filepath")
-                        or tagged.get("path")
-                        or tagged.get("audio"),
-                        "text": tagged.get("text"),
-                        "audio_tags_source": tagged.get("audio_tags_source"),
-                        "audio_tag_topk": tagged.get("audio_tag_topk"),
-                    }
-                    if "audio_tag_frames_raw" in tagged:
-                        slim["audio_tag_frames_raw"] = tagged.get("audio_tag_frames_raw")
-                    outfile.write(json.dumps(slim, ensure_ascii=False) + "\n")
-                else:
-                    outfile.write(json.dumps(tagged, ensure_ascii=False) + "\n")
-                processed_audio_keys.update(entry_audio_keys)
+            _flush_pending(pending_entries)
 
     logger.info("Tagged manifest written to %s", output_path)
+    logger.info("Rows written: %d", written_entries)
+    logger.info("Rows failed and skipped: %d", failed_entries)
+    if failed_entries > 0:
+        logger.error("Completed with failures; see logs above.")
+        return 2
     return 0
 
 

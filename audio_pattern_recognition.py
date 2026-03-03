@@ -66,6 +66,12 @@ RESPIRATORY_LABELS = [
     "Sniff",
 ]
 
+# Music/instrument-related labels to help downstream filtering of non-speech content.
+MUSIC_INSTRUMENT_LABELS = [
+    "Music",
+    "Musical instrument",
+]
+
 
 def _dedupe_keep_order(labels: Sequence[str]) -> List[str]:
     seen = set()
@@ -79,7 +85,7 @@ def _dedupe_keep_order(labels: Sequence[str]) -> List[str]:
 
 
 TARGET_LABELS = _dedupe_keep_order(
-    SPEECH_LABELS + HUMAN_VOICE_LABELS + RESPIRATORY_LABELS
+    SPEECH_LABELS + HUMAN_VOICE_LABELS + RESPIRATORY_LABELS + MUSIC_INSTRUMENT_LABELS
 )
 
 
@@ -234,19 +240,23 @@ def _resolve_label_indices(
 def _extract_centered_context(
     audio: np.ndarray, center_sample: int, context_samples: int
 ) -> np.ndarray:
-    out = np.zeros((context_samples,), dtype=np.float32)
+    if context_samples <= 0:
+        return np.zeros((0,), dtype=np.float32)
+    if audio.size == 0:
+        return np.zeros((context_samples,), dtype=np.float32)
+
     start = center_sample - (context_samples // 2)
     end = start + context_samples
+    n = int(audio.shape[0])
 
-    src_start = max(0, start)
-    src_end = min(audio.shape[0], end)
-    if src_end <= src_start:
-        return out
-
-    dst_start = src_start - start
-    dst_end = dst_start + (src_end - src_start)
-    out[dst_start:dst_end] = audio[src_start:src_end]
-    return out
+    left_pad = max(0, -start)
+    right_pad = max(0, end - n)
+    mode = "reflect" if n > 1 else "edge"
+    padded = np.pad(audio, (left_pad, right_pad), mode=mode)
+    start_padded = start + left_pad
+    return padded[start_padded : start_padded + context_samples].astype(
+        np.float32, copy=False
+    )
 
 
 def _build_frame_starts(
@@ -365,38 +375,32 @@ def _tag_audio(
 
     if not frames:
         result: Dict[str, object] = {
-            "audio_tags_source": "framewise_max",
-            "audio_tags": _round_probs(
-                {label: 0.0 for label in label_names}, round_digits, min_prob
-            ),
+            "audio_tags_source": "ast_framewise_center",
             "audio_tag_frames": [],
         }
         if save_raw_frames:
             result["audio_tag_frames_raw"] = []
         return result
 
-    selected_probs = np.stack(
-        [[float(probs[idx]) for idx in label_indices] for _, _, probs in frames],
-        axis=0,
-    )
-    smoothed_probs = _smooth_frame_probs(selected_probs, aggregation_window_frames)
-    max_probs = smoothed_probs.max(axis=0)
+    all_probs = np.stack([p for _, _, p in frames], axis=0)  # (T, 527)
+    selected_probs = all_probs[:, label_indices].astype(np.float32, copy=False)
 
+    smoothed_probs = _smooth_frame_probs(selected_probs, aggregation_window_frames)
     frame_entries = []
     raw_entries = []
     for frame_idx, (t0, t1, probs) in enumerate(frames):
-        frame_tags = {label: float(v) for label, v in zip(label_names, smoothed_probs[frame_idx])}
-        filtered_frame_tags = _round_probs(frame_tags, round_digits, min_prob)
-        if filtered_frame_tags:
-            best_idx = int(np.argmax(probs))
-            frame_entries.append(
-                {
-                    "start": segment_start + t0,
-                    "end": segment_start + t1,
-                    "top_label": model.config.id2label[best_idx],
-                    "audio_tags": filtered_frame_tags,
-                }
-            )
+        frame_tags = {
+            label: float(v) for label, v in zip(label_names, smoothed_probs[frame_idx])
+        }
+        if round_digits is not None:
+            frame_tags = {k: round(v, round_digits) for k, v in frame_tags.items()}
+        frame_entries.append(
+            {
+                "start": segment_start + t0,
+                "end": segment_start + t1,
+                "audio_tags": frame_tags,
+            }
+        )
 
         if save_raw_frames:
             top_idx = np.argsort(-probs)[: max(raw_top_k, 1)]
@@ -418,12 +422,7 @@ def _tag_audio(
                 )
 
     result = {
-        "audio_tags_source": "framewise_max",
-        "audio_tags": _round_probs(
-            {label: float(value) for label, value in zip(label_names, max_probs)},
-            round_digits,
-            min_prob,
-        ),
+        "audio_tags_source": "ast_framewise_center",
         "audio_tag_frames": frame_entries,
     }
 
@@ -680,7 +679,6 @@ def main() -> int:
                     or tagged.get("audio"),
                     "text": tagged.get("text"),
                     "audio_tags_source": tagged.get("audio_tags_source"),
-                    "audio_tags": tagged.get("audio_tags"),
                     "audio_tag_frames": tagged.get("audio_tag_frames"),
                 }
                 if "audio_tag_frames_raw" in tagged:
