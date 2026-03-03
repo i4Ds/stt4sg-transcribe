@@ -21,6 +21,7 @@ from tqdm.auto import tqdm
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_ID = "MIT/ast-finetuned-audioset-10-10-0.4593"
+MIN_TAG_START_SECONDS = 0.0
 
 # Ontology-aligned target labels.
 SPEECH_LABELS = [
@@ -389,6 +390,11 @@ def _tag_audio(
     frame_entries = []
     raw_entries = []
     for frame_idx, (t0, t1, probs) in enumerate(frames):
+        frame_start = segment_start + t0
+        frame_end = segment_start + t1
+        if frame_start < MIN_TAG_START_SECONDS:
+            continue
+
         frame_tags = {
             label: float(v) for label, v in zip(label_names, smoothed_probs[frame_idx])
         }
@@ -396,8 +402,8 @@ def _tag_audio(
             frame_tags = {k: round(v, round_digits) for k, v in frame_tags.items()}
         frame_entries.append(
             {
-                "start": segment_start + t0,
-                "end": segment_start + t1,
+                "start": frame_start,
+                "end": frame_end,
                 "audio_tags": frame_tags,
             }
         )
@@ -415,8 +421,8 @@ def _tag_audio(
             if top_labels:
                 raw_entries.append(
                     {
-                        "start": segment_start + t0,
-                        "end": segment_start + t1,
+                        "start": frame_start,
+                        "end": frame_end,
                         "top_labels": top_labels,
                     }
                 )

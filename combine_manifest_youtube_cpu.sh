@@ -37,9 +37,9 @@ MANIFEST="${ROOT_DIR}/manifest.jsonl"
 EMOTION="${ROOT_DIR}/manifest.emotion.jsonl"
 OMNI="${ROOT_DIR}/manifest.omni.all.mixed50.ctx.zs.jsonl"
 DIALECT="${ROOT_DIR}/manifest_with_speaker_dialect.jsonl"
-TAGGED="${ROOT_DIR}/manifest.tagged.sed.h200.v2.fullclip.jsonl"
-OUT="${ROOT_DIR}/manifest_combined.jsonl"
-MISSING_CSV="${ROOT_DIR}/manifest_combined_missing.csv"
+TAGGED="${ROOT_DIR}/manifest.tagged.h200.v2.sliding.jsonl"
+OUT="${ROOT_DIR}/manifest_combined_sliding.jsonl"
+MISSING_CSV="${ROOT_DIR}/manifest_combined_missing_sliding.csv"
 
 [ -f "${MANIFEST}" ] || { echo "Missing file: ${MANIFEST}"; exit 1; }
 [ -f "${EMOTION}" ] || { echo "Missing file: ${EMOTION}"; exit 1; }

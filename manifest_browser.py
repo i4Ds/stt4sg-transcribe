@@ -14,6 +14,7 @@ from typing import Any
 import gradio as gr
 
 DEFAULT_MANIFEST = "/mnt/nas05/data02/vincenzo/podcast_data/youtube/processed/manifest_combined_sample.jsonl"
+TAG_DISPLAY_MIN_START_SECONDS = 2.0
 
 RAW_JSON_KEYS = [
     "audio_path",
@@ -203,11 +204,24 @@ DISPLAY_TAG_LABEL = {
 }
 
 TAG_GROUP_LAUGHTER = "Laughter"
+TAG_GROUP_CHUCKLE = "Chuckle/Giggle"
 TAG_GROUP_BREATHING = "Breathing"
 TAG_GROUP_SIGH = "Sigh"
 
 
 def _tag_group_from_raw_label(label: str) -> str | None:
+    canonical = _normalize_tag_label(label)
+    if canonical == "<speech>":
+        return None
+    if canonical == "<laugh>":
+        return TAG_GROUP_LAUGHTER
+    if canonical == "<chuckle>":
+        return TAG_GROUP_CHUCKLE
+    if canonical == "<sigh>":
+        return TAG_GROUP_SIGH
+    if canonical in {"<cough>", "<sniffle>", "<groan>", "<yawn>", "<gasp>"}:
+        return TAG_GROUP_BREATHING
+
     raw = label.strip().lower()
     if not raw:
         return None
@@ -216,11 +230,15 @@ def _tag_group_from_raw_label(label: str) -> str | None:
         "laughter",
         "baby laughter",
         "belly laugh",
+    }:
+        return TAG_GROUP_LAUGHTER
+
+    if raw in {
         "snicker",
         "chuckle, chortle",
         "giggle",
     }:
-        return TAG_GROUP_LAUGHTER
+        return TAG_GROUP_CHUCKLE
 
     if raw in {"sigh"}:
         return TAG_GROUP_SIGH
@@ -255,10 +273,10 @@ def _normalize_tag_label(label: str) -> str | None:
     if raw in SPEECH_TAGS:
         return "<speech>"
 
-    if raw in {"laughter", "baby laughter", "belly laugh"}:
+    if raw in {"laughter"}:
         return "<laugh>"
     if raw in {"snicker", "chuckle, chortle", "giggle"}:
-        return "<chuckle>"
+        return "<laugh>"
     if raw in {"sigh"}:
         return "<sigh>"
     if raw in {"cough", "throat clearing"}:
@@ -606,6 +624,8 @@ def _emotion_color(label: str) -> str:
 
 
 def _tag_color(label: str) -> str:
+    if label == TAG_GROUP_CHUCKLE:
+        return "#fb923c"
     if label == TAG_GROUP_LAUGHTER:
         return "#f59e0b"
     if label == TAG_GROUP_SIGH:
@@ -985,7 +1005,6 @@ def _merge_group_events(
         if (
             merged
             and row["label"] == merged[-1]["label"]
-            and row.get("raw_label") == merged[-1].get("raw_label")
             and row["start"] <= merged[-1]["end"] + merge_gap
         ):
             prev = merged[-1]
@@ -1023,103 +1042,181 @@ def _merge_group_events(
 def _group_tag_events(
     record: dict[str, Any],
     *,
-    min_overall_prob: float = 0.4,
     sigh_min_prob: float = 0.0,
     laughter_min_prob: float = 0.0,
+    chuckle_min_prob: float = 0.0,
     breathing_min_prob: float = 0.0,
 ) -> dict[str, list[dict[str, Any]]]:
     out: dict[str, list[dict[str, Any]]] = {
         TAG_GROUP_SIGH: [],
         TAG_GROUP_LAUGHTER: [],
+        TAG_GROUP_CHUCKLE: [],
         TAG_GROUP_BREATHING: [],
     }
 
-    topk = record.get("audio_tag_topk")
-    if not isinstance(topk, dict):
-        return out
-
-    idx_rows = topk.get("top_idx")
-    prob_rows = topk.get("top_prob")
-    if not isinstance(idx_rows, list) or not isinstance(prob_rows, list):
-        return out
-
-    row_count = min(len(idx_rows), len(prob_rows))
-    duration = _as_float(record.get("duration"))
-    if duration is None or duration <= 0:
-        seg_start = _as_float(record.get("start"))
-        seg_end = _as_float(record.get("end"))
-        if seg_start is not None and seg_end is not None and seg_end > seg_start:
-            duration = seg_end - seg_start
-    if duration is None or duration <= 0:
-        duration = float(max(row_count, 1)) * 0.02
-    step = duration / float(max(row_count, 1))
-    min_overall_prob = max(0.0, min(1.0, float(min_overall_prob)))
     sigh_min_prob = max(0.0, min(1.0, float(sigh_min_prob)))
     laughter_min_prob = max(0.0, min(1.0, float(laughter_min_prob)))
+    chuckle_min_prob = max(0.0, min(1.0, float(chuckle_min_prob)))
     breathing_min_prob = max(0.0, min(1.0, float(breathing_min_prob)))
 
-    for i in range(row_count):
-        idx_row = idx_rows[i]
-        prob_row = prob_rows[i]
-        if not isinstance(idx_row, list) or not isinstance(prob_row, list):
-            continue
+    def _group_threshold(group: str) -> float:
+        if group == TAG_GROUP_LAUGHTER:
+            return laughter_min_prob
+        if group == TAG_GROUP_CHUCKLE:
+            return chuckle_min_prob
+        if group == TAG_GROUP_SIGH:
+            return sigh_min_prob
+        return breathing_min_prob
 
-        best_by_group: dict[str, tuple[str, float]] = {}
-        for raw_idx, raw_prob in zip(idx_row, prob_row):
-            if not isinstance(raw_idx, int):
+    def _append_group_rows(
+        *,
+        start: float,
+        end: float,
+        group_scores: dict[str, float],
+        group_label_scores: dict[str, dict[str, list[float]]],
+    ) -> None:
+        for group, window_max_prob in group_scores.items():
+            mean_prob = float(window_max_prob)
+            if mean_prob < _group_threshold(group):
                 continue
-            if raw_idx < 0 or raw_idx >= len(TOPK_LABEL_VOCAB):
-                continue
-            prob = _as_float(raw_prob)
-            if prob is None:
-                continue
-            raw_label = TOPK_LABEL_VOCAB[raw_idx]
-            group = _tag_group_from_raw_label(raw_label)
-            if group is None:
-                continue
-            if group == TAG_GROUP_LAUGHTER:
-                min_needed = max(min_overall_prob, laughter_min_prob)
-            elif group == TAG_GROUP_SIGH:
-                min_needed = max(min_overall_prob, sigh_min_prob)
-            else:
-                min_needed = max(min_overall_prob, breathing_min_prob)
-            if prob < min_needed:
-                continue
-            prev = best_by_group.get(group)
-            if prev is None or prob > prev[1]:
-                best_by_group[group] = (raw_label, prob)
-
-        for group, (raw_label, prob) in best_by_group.items():
+            raw_scores = group_label_scores.get(group, {})
+            raw_top3 = sorted(
+                (
+                    (lbl, sum(vals) / float(len(vals)))
+                    for lbl, vals in raw_scores.items()
+                    if vals
+                ),
+                key=lambda x: (-x[1], x[0]),
+            )[:3]
+            raw_label = raw_top3[0][0] if raw_top3 else group
             out[group].append(
                 {
-                    "start": round(float(i) * step, 3),
-                    "end": round(float(i + 1) * step, 3),
+                    "start": round(start, 3),
+                    "end": round(end, 3),
                     "label": group,
                     "raw_label": raw_label,
-                    "score": round(float(prob), 4),
-                    "raw_top3": [(raw_label, round(float(prob), 4))],
+                    "score": round(float(mean_prob), 4),
+                    "raw_top3": [
+                        (lbl, round(float(prob), 4)) for lbl, prob in raw_top3
+                    ],
                 }
+            )
+
+    topk = record.get("audio_tag_topk")
+    if isinstance(topk, dict):
+        idx_rows = topk.get("top_idx")
+        prob_rows = topk.get("top_prob")
+        if isinstance(idx_rows, list) and isinstance(prob_rows, list):
+            row_count = min(len(idx_rows), len(prob_rows))
+            duration = _as_float(record.get("duration"))
+            if duration is None or duration <= 0:
+                seg_start = _as_float(record.get("start"))
+                seg_end = _as_float(record.get("end"))
+                if (
+                    seg_start is not None
+                    and seg_end is not None
+                    and seg_end > seg_start
+                ):
+                    duration = seg_end - seg_start
+            if duration is None or duration <= 0:
+                duration = float(max(row_count, 1)) * 0.02
+            step = duration / float(max(row_count, 1))
+
+            for i in range(row_count):
+                idx_row = idx_rows[i]
+                prob_row = prob_rows[i]
+                if not isinstance(idx_row, list) or not isinstance(prob_row, list):
+                    continue
+                group_scores: dict[str, float] = {}
+                group_label_scores: dict[str, dict[str, list[float]]] = {}
+                for raw_idx, raw_prob in zip(idx_row, prob_row):
+                    if not isinstance(raw_idx, int):
+                        continue
+                    if raw_idx < 0 or raw_idx >= len(TOPK_LABEL_VOCAB):
+                        continue
+                    prob = _as_float(raw_prob)
+                    if prob is None:
+                        continue
+                    raw_label = TOPK_LABEL_VOCAB[raw_idx]
+                    group = _tag_group_from_raw_label(raw_label)
+                    if group is None:
+                        continue
+                    prev = group_scores.get(group)
+                    group_scores[group] = prob if prev is None else max(prev, prob)
+                    group_label_scores.setdefault(group, {}).setdefault(
+                        raw_label, []
+                    ).append(prob)
+                _append_group_rows(
+                    start=float(i) * step,
+                    end=float(i + 1) * step,
+                    group_scores=group_scores,
+                    group_label_scores=group_label_scores,
+                )
+
+    frames = record.get("audio_tag_frames")
+    if isinstance(frames, list):
+        for frame in frames:
+            if not isinstance(frame, dict):
+                continue
+            start = _as_float(frame.get("start"))
+            end = _as_float(frame.get("end"))
+            tags = frame.get("audio_tags")
+            if start is None or end is None or not isinstance(tags, dict):
+                continue
+            if end < start:
+                start, end = end, start
+            group_scores: dict[str, float] = {}
+            group_label_scores: dict[str, dict[str, list[float]]] = {}
+            for raw_label, raw_prob in tags.items():
+                if not isinstance(raw_label, str):
+                    continue
+                prob = _as_float(raw_prob)
+                if prob is None:
+                    continue
+                group = _tag_group_from_raw_label(raw_label)
+                if group is None:
+                    continue
+                prev = group_scores.get(group)
+                group_scores[group] = prob if prev is None else max(prev, prob)
+                group_label_scores.setdefault(group, {}).setdefault(
+                    raw_label, []
+                ).append(prob)
+            _append_group_rows(
+                start=start,
+                end=end,
+                group_scores=group_scores,
+                group_label_scores=group_label_scores,
             )
 
     out[TAG_GROUP_SIGH] = _merge_group_events(out[TAG_GROUP_SIGH])
     out[TAG_GROUP_LAUGHTER] = _merge_group_events(out[TAG_GROUP_LAUGHTER])
+    out[TAG_GROUP_CHUCKLE] = _merge_group_events(out[TAG_GROUP_CHUCKLE])
     out[TAG_GROUP_BREATHING] = _merge_group_events(out[TAG_GROUP_BREATHING])
     return out
 
 
 def _filter_group_events(
-    rows: list[dict[str, Any]], *, min_prob: float, min_duration_s: float
+    rows: list[dict[str, Any]],
+    *,
+    min_prob: float,
+    min_duration_s: float = 0.0,
+    min_start_seconds: float = 0.0,
 ) -> list[dict[str, Any]]:
     min_prob = max(0.0, min(1.0, float(min_prob)))
     min_duration_s = max(0.0, float(min_duration_s))
+    min_start_seconds = max(0.0, float(min_start_seconds))
     kept: list[dict[str, Any]] = []
     for row in rows:
         score = _as_float(row.get("score"))
         start = _as_float(row.get("start"))
         end = _as_float(row.get("end"))
-        if score is None or start is None or end is None:
+        if score is None:
             continue
         if score < min_prob:
+            continue
+        if start is None or end is None:
+            continue
+        if start < min_start_seconds:
             continue
         if (end - start) < min_duration_s:
             continue
@@ -1394,39 +1491,44 @@ def _merge_adjacent_tag_rows(
 
 def _fmt_timeline_html(
     record: dict[str, Any],
-    min_overall_prob: float = 0.4,
     sigh_min_prob: float = 0.0,
-    sigh_min_duration_s: float = 0.0,
     laughter_min_prob: float = 0.0,
     laughter_min_duration_s: float = 0.0,
+    chuckle_min_prob: float = 0.0,
     breathing_min_prob: float = 0.0,
-    breathing_min_duration_s: float = 0.0,
 ) -> str:
     emotion_timeline = _emotion_timeline(record)
     grouped_tag_events = _group_tag_events(
         record,
-        min_overall_prob=min_overall_prob,
         sigh_min_prob=sigh_min_prob,
         laughter_min_prob=laughter_min_prob,
+        chuckle_min_prob=chuckle_min_prob,
         breathing_min_prob=breathing_min_prob,
     )
     laughter_rows = _filter_group_events(
         grouped_tag_events.get(TAG_GROUP_LAUGHTER, []),
         min_prob=laughter_min_prob,
         min_duration_s=laughter_min_duration_s,
+        min_start_seconds=TAG_DISPLAY_MIN_START_SECONDS,
     )
     sigh_rows = _filter_group_events(
         grouped_tag_events.get(TAG_GROUP_SIGH, []),
         min_prob=sigh_min_prob,
-        min_duration_s=sigh_min_duration_s,
+        min_start_seconds=TAG_DISPLAY_MIN_START_SECONDS,
+    )
+    chuckle_rows = _filter_group_events(
+        grouped_tag_events.get(TAG_GROUP_CHUCKLE, []),
+        min_prob=chuckle_min_prob,
+        min_start_seconds=TAG_DISPLAY_MIN_START_SECONDS,
     )
     breathing_rows = _filter_group_events(
         grouped_tag_events.get(TAG_GROUP_BREATHING, []),
         min_prob=breathing_min_prob,
-        min_duration_s=breathing_min_duration_s,
+        min_start_seconds=TAG_DISPLAY_MIN_START_SECONDS,
     )
     total = _segment_duration(
-        record, [emotion_timeline, laughter_rows, sigh_rows, breathing_rows]
+        record,
+        [emotion_timeline, laughter_rows, sigh_rows, chuckle_rows, breathing_rows],
     )
     if total <= 0:
         total = 1.0
@@ -1452,14 +1554,15 @@ def _fmt_timeline_html(
     container_id = f"mb-{random.randrange(1_000_000_000):x}"
 
     svg_w = 1000.0
-    svg_h = 208.0
+    svg_h = 200.0
     x0 = 0.0
     xw = 1000.0
-    emo_y = 30.0
-    laugh_y = 72.0
-    sigh_y = 114.0
-    breath_y = 156.0
-    track_h = 22.0
+    emo_y = 26.0
+    laugh_y = 60.0
+    sigh_y = 94.0
+    chuckle_y = 128.0
+    breath_y = 162.0
+    track_h = 14.0
 
     emotion_rects, emotion_hover = _svg_track_rects(
         emotion_timeline,
@@ -1493,6 +1596,18 @@ def _fmt_timeline_html(
         width=xw,
         color_fn=_tag_color,
         lane_name=TAG_GROUP_SIGH,
+        show_label=False,
+        squish_px=2.2,
+    )
+    chuckle_rects, chuckle_hover = _svg_track_rects(
+        chuckle_rows,
+        total=total,
+        y=chuckle_y,
+        height=track_h,
+        x0=x0,
+        width=xw,
+        color_fn=_tag_color,
+        lane_name=TAG_GROUP_CHUCKLE,
         show_label=False,
         squish_px=2.2,
     )
@@ -1554,8 +1669,8 @@ def _fmt_timeline_html(
   --mb-list-text: #f4f4f5;
 }}
 .mb-head {{
-  font-size: 14px;
-  margin: 0 0 8px 0;
+  font-size: 13px;
+  margin: 0 0 6px 0;
   padding: 0 2px;
 }}
 .mb-chart {{
@@ -1681,7 +1796,7 @@ def _fmt_timeline_html(
   box-sizing: border-box;
   margin: 0;
   border: 1px solid var(--mb-border);
-  border-radius: 8px;
+  border-radius: 6px;
   background: var(--mb-list-bg);
 }}
 .mb-pill {{
@@ -1706,18 +1821,22 @@ def _fmt_timeline_html(
       <rect class="mb-svg-bg" x="{x0:.2f}" y="{emo_y:.2f}" width="{xw:.2f}" height="{track_h:.2f}" rx="4"></rect>
       <rect class="mb-svg-bg" x="{x0:.2f}" y="{laugh_y:.2f}" width="{xw:.2f}" height="{track_h:.2f}" rx="4"></rect>
       <rect class="mb-svg-bg" x="{x0:.2f}" y="{sigh_y:.2f}" width="{xw:.2f}" height="{track_h:.2f}" rx="4"></rect>
+      <rect class="mb-svg-bg" x="{x0:.2f}" y="{chuckle_y:.2f}" width="{xw:.2f}" height="{track_h:.2f}" rx="4"></rect>
       <rect class="mb-svg-bg" x="{x0:.2f}" y="{breath_y:.2f}" width="{xw:.2f}" height="{track_h:.2f}" rx="4"></rect>
       <text class="mb-lane-label" x="{x0 + 6:.1f}" y="{emo_y + track_h - 6:.1f}" font-size="10" font-weight="700">Emotion</text>
       <text class="mb-lane-label" x="{x0 + 6:.1f}" y="{laugh_y + track_h - 6:.1f}" font-size="10" font-weight="700">{TAG_GROUP_LAUGHTER}</text>
       <text class="mb-lane-label" x="{x0 + 6:.1f}" y="{sigh_y + track_h - 6:.1f}" font-size="10" font-weight="700">{TAG_GROUP_SIGH}</text>
-      <text class="mb-lane-label" x="{x0 + 6:.1f}" y="{breath_y + track_h - 6:.1f}" font-size="10" font-weight="700">{TAG_GROUP_BREATHING}</text>
+      <text class="mb-lane-label" x="{x0 + 6:.1f}" y="{chuckle_y + track_h - 6:.1f}" font-size="10" font-weight="700">{TAG_GROUP_CHUCKLE}</text>
+      <text class="mb-lane-label" x="{x0 + 6:.1f}" y="{breath_y + track_h - 6:.1f}" font-size="10" font-weight="700">Breathing/Gasp+</text>
       {emotion_rects}
       {tag1_rects}
       {sigh_rects}
+      {chuckle_rects}
       {tag2_rects}
       {emotion_hover}
       {tag1_hover}
       {sigh_hover}
+      {chuckle_hover}
       {tag2_hover}
     </svg>
   </div>
@@ -1799,23 +1918,19 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
         "current_row_id": None,
     }
     fixed_manifest = Path(default_manifest).expanduser()
-    initial_min_overall_prob = 0.4
-    initial_sigh_min_prob = 0.0
-    initial_sigh_min_duration_s = 0.0
-    initial_laughter_min_prob = 0.0
-    initial_laughter_min_duration_s = 0.0
-    initial_breathing_min_prob = 0.0
-    initial_breathing_min_duration_s = 0.0
+    initial_sigh_min_prob = 0.4
+    initial_laughter_min_prob = 0.45
+    initial_laughter_min_duration_s = 1.2
+    initial_chuckle_min_prob = 0.3
+    initial_breathing_min_prob = 0.4
 
     def _row_bundle(
         record: dict[str, Any],
-        min_overall_prob: float,
         sigh_min_prob: float,
-        sigh_min_duration_s: float,
         laughter_min_prob: float,
         laughter_min_duration_s: float,
+        chuckle_min_prob: float,
         breathing_min_prob: float,
-        breathing_min_duration_s: float,
     ):
         audio = str(record.get("audio_path", ""))
         if not audio or not Path(audio).exists():
@@ -1824,13 +1939,11 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
             audio,
             _fmt_timeline_html(
                 record,
-                min_overall_prob=min_overall_prob,
                 sigh_min_prob=sigh_min_prob,
-                sigh_min_duration_s=sigh_min_duration_s,
                 laughter_min_prob=laughter_min_prob,
                 laughter_min_duration_s=laughter_min_duration_s,
+                chuckle_min_prob=chuckle_min_prob,
                 breathing_min_prob=breathing_min_prob,
-                breathing_min_duration_s=breathing_min_duration_s,
             ),
             _fmt_record_summary(record),
             json.dumps(_select_raw_json_fields(record), ensure_ascii=False, indent=2),
@@ -1853,13 +1966,11 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
 
     def _render_row(
         row_id: int,
-        min_overall_prob: float,
         sigh_min_prob: float,
-        sigh_min_duration_s: float,
         laughter_min_prob: float,
         laughter_min_duration_s: float,
+        chuckle_min_prob: float,
         breathing_min_prob: float,
-        breathing_min_duration_s: float,
     ):
         store = browser.get("store")
         total_rows = int(browser.get("total_rows", 0))
@@ -1871,13 +1982,11 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
         row = store.get_row(row_id)
         audio, timeline_html, summary, raw = _row_bundle(
             row,
-            min_overall_prob,
             sigh_min_prob,
-            sigh_min_duration_s,
             laughter_min_prob,
             laughter_min_duration_s,
+            chuckle_min_prob,
             breathing_min_prob,
-            breathing_min_duration_s,
         )
         return (
             _id_markdown(row_id, total_rows),
@@ -1908,22 +2017,28 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
             browser["current_row_id"] = 0
             initial_audio, initial_timeline, initial_summary, initial_raw = _row_bundle(
                 store.get_row(0),
-                initial_min_overall_prob,
                 initial_sigh_min_prob,
-                initial_sigh_min_duration_s,
                 initial_laughter_min_prob,
                 initial_laughter_min_duration_s,
+                initial_chuckle_min_prob,
                 initial_breathing_min_prob,
-                initial_breathing_min_duration_s,
             )
             initial_current_id_md = _id_markdown(0, total)
             initial_jump_value = 0
 
-    with gr.Blocks(title="Manifest Audio Browser") as app:
+    with gr.Blocks(
+        title="Manifest Audio Browser",
+        css="""
+#segment-audio audio { max-height: 42px; }
+#segment-audio .wrap { min-height: 52px !important; }
+""",
+    ) as app:
         gr.Markdown("## Manifest Audio Browser")
         with gr.Row():
             prev_btn = gr.Button("Previous ID")
-            next_btn = gr.Button("Next ID", variant="primary")
+            with gr.Column():
+                next_btn = gr.Button("Next ID", variant="primary")
+                random_btn = gr.Button("Random")
             jump_id_input = gr.Number(
                 label="Jump to ID",
                 value=initial_jump_value,
@@ -1932,77 +2047,59 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
             jump_btn = gr.Button("Jump")
 
         current_id_md = gr.Markdown(initial_current_id_md)
-        min_overall_prob_slider = gr.Slider(
-            minimum=0.0,
-            maximum=1.0,
-            step=0.05,
-            value=initial_min_overall_prob,
-            label="Global min logits/prob (applies to all tags)",
-        )
         with gr.Row():
-            with gr.Column():
-                sigh_prob_slider = gr.Slider(
-                    minimum=0.0,
-                    maximum=1.0,
-                    step=0.05,
-                    value=initial_sigh_min_prob,
-                    label="Sigh min logits/prob",
-                )
-                sigh_duration_slider = gr.Slider(
-                    minimum=0.0,
-                    maximum=6.0,
-                    step=0.05,
-                    value=initial_sigh_min_duration_s,
-                    label="Sigh min duration (s)",
-                )
-            with gr.Column():
-                laughter_prob_slider = gr.Slider(
-                    minimum=0.0,
-                    maximum=1.0,
-                    step=0.05,
-                    value=initial_laughter_min_prob,
-                    label="Laughter min logits/prob",
-                )
-                laughter_duration_slider = gr.Slider(
-                    minimum=0.0,
-                    maximum=6.0,
-                    step=0.05,
-                    value=initial_laughter_min_duration_s,
-                    label="Laughter min duration (s)",
-                )
-            with gr.Column():
-                breathing_prob_slider = gr.Slider(
-                    minimum=0.0,
-                    maximum=1.0,
-                    step=0.05,
-                    value=initial_breathing_min_prob,
-                    label="Breathing min logits/prob",
-                )
-                breathing_duration_slider = gr.Slider(
-                    minimum=0.0,
-                    maximum=2.0,
-                    step=0.05,
-                    value=initial_breathing_min_duration_s,
-                    label="Breathing min duration (s)",
-                )
+            sigh_prob_slider = gr.Slider(
+                minimum=0.0,
+                maximum=1.0,
+                step=0.05,
+                value=initial_sigh_min_prob,
+                label="Sigh min prob",
+            )
+            laughter_prob_slider = gr.Slider(
+                minimum=0.0,
+                maximum=1.0,
+                step=0.05,
+                value=initial_laughter_min_prob,
+                label="Laughter min prob",
+            )
+            laughter_duration_slider = gr.Slider(
+                minimum=0.0,
+                maximum=6.0,
+                step=0.05,
+                value=initial_laughter_min_duration_s,
+                label="Laughter min duration (s)",
+            )
+            chuckle_prob_slider = gr.Slider(
+                minimum=0.0,
+                maximum=1.0,
+                step=0.05,
+                value=initial_chuckle_min_prob,
+                label="Chuckle/Giggle min prob",
+            )
+            breathing_prob_slider = gr.Slider(
+                minimum=0.0,
+                maximum=1.0,
+                step=0.05,
+                value=initial_breathing_min_prob,
+                label="Breathing/Gasp+ min prob",
+            )
 
         audio_player = gr.Audio(
             label="Segment Audio",
             type="filepath",
             value=initial_audio,
+            elem_id="segment-audio",
         )
         timeline_md = gr.HTML(initial_timeline)
         summary_md = gr.Markdown(initial_summary)
         raw_json = gr.Code(label="Raw record JSON", language="json", value=initial_raw)
 
         def go_prev(
-            min_overall_prob: float,
             sigh_min_prob: float,
-            sigh_min_duration_s: float,
             laughter_min_prob: float,
             laughter_min_duration_s: float,
+            chuckle_min_prob: float,
             breathing_min_prob: float,
-            breathing_min_duration_s: float,
         ):
             total_rows = int(browser.get("total_rows", 0))
             if total_rows <= 0:
@@ -2011,23 +2108,19 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
             current_id = int(current) if isinstance(current, int) else 0
             return _render_row(
                 current_id - 1,
-                min_overall_prob,
                 sigh_min_prob,
-                sigh_min_duration_s,
                 laughter_min_prob,
                 laughter_min_duration_s,
+                chuckle_min_prob,
                 breathing_min_prob,
-                breathing_min_duration_s,
             )
 
         def go_next(
-            min_overall_prob: float,
             sigh_min_prob: float,
-            sigh_min_duration_s: float,
             laughter_min_prob: float,
             laughter_min_duration_s: float,
+            chuckle_min_prob: float,
             breathing_min_prob: float,
-            breathing_min_duration_s: float,
         ):
             total_rows = int(browser.get("total_rows", 0))
             if total_rows <= 0:
@@ -2036,24 +2129,20 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
             current_id = int(current) if isinstance(current, int) else 0
             return _render_row(
                 current_id + 1,
-                min_overall_prob,
                 sigh_min_prob,
-                sigh_min_duration_s,
                 laughter_min_prob,
                 laughter_min_duration_s,
+                chuckle_min_prob,
                 breathing_min_prob,
-                breathing_min_duration_s,
             )
 
         def jump_to_id(
             jump_row_id: float | int | None,
-            min_overall_prob: float,
             sigh_min_prob: float,
-            sigh_min_duration_s: float,
             laughter_min_prob: float,
             laughter_min_duration_s: float,
+            chuckle_min_prob: float,
             breathing_min_prob: float,
-            breathing_min_duration_s: float,
         ):
             total_rows = int(browser.get("total_rows", 0))
             if total_rows <= 0:
@@ -2065,23 +2154,39 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
                 target = int(jump_row_id)
             return _render_row(
                 target,
-                min_overall_prob,
                 sigh_min_prob,
-                sigh_min_duration_s,
                 laughter_min_prob,
                 laughter_min_duration_s,
+                chuckle_min_prob,
                 breathing_min_prob,
-                breathing_min_duration_s,
+            )
+
+        def go_random(
+            sigh_min_prob: float,
+            laughter_min_prob: float,
+            laughter_min_duration_s: float,
+            chuckle_min_prob: float,
+            breathing_min_prob: float,
+        ):
+            total_rows = int(browser.get("total_rows", 0))
+            if total_rows <= 0:
+                return _empty_outputs("Manifest is empty.")
+            target = random.randrange(total_rows)
+            return _render_row(
+                target,
+                sigh_min_prob,
+                laughter_min_prob,
+                laughter_min_duration_s,
+                chuckle_min_prob,
+                breathing_min_prob,
             )
 
         def refresh_timeline(
-            min_overall_prob: float,
             sigh_min_prob: float,
-            sigh_min_duration_s: float,
             laughter_min_prob: float,
             laughter_min_duration_s: float,
+            chuckle_min_prob: float,
             breathing_min_prob: float,
-            breathing_min_duration_s: float,
         ):
             store = browser.get("store")
             row_id = browser.get("current_row_id")
@@ -2090,25 +2195,21 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
             row = store.get_row(row_id)
             return _fmt_timeline_html(
                 row,
-                min_overall_prob=min_overall_prob,
                 sigh_min_prob=sigh_min_prob,
-                sigh_min_duration_s=sigh_min_duration_s,
                 laughter_min_prob=laughter_min_prob,
                 laughter_min_duration_s=laughter_min_duration_s,
+                chuckle_min_prob=chuckle_min_prob,
                 breathing_min_prob=breathing_min_prob,
-                breathing_min_duration_s=breathing_min_duration_s,
             )
 
         prev_btn.click(
             go_prev,
             inputs=[
-                min_overall_prob_slider,
                 sigh_prob_slider,
-                sigh_duration_slider,
                 laughter_prob_slider,
                 laughter_duration_slider,
+                chuckle_prob_slider,
                 breathing_prob_slider,
-                breathing_duration_slider,
             ],
             outputs=[
                 current_id_md,
@@ -2122,13 +2223,29 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
         next_btn.click(
             go_next,
             inputs=[
-                min_overall_prob_slider,
                 sigh_prob_slider,
-                sigh_duration_slider,
                 laughter_prob_slider,
                 laughter_duration_slider,
+                chuckle_prob_slider,
                 breathing_prob_slider,
-                breathing_duration_slider,
+            ],
+            outputs=[
+                current_id_md,
+                audio_player,
+                timeline_md,
+                summary_md,
+                raw_json,
+                jump_id_input,
+            ],
+        )
+        random_btn.click(
+            go_random,
+            inputs=[
+                sigh_prob_slider,
+                laughter_prob_slider,
+                laughter_duration_slider,
+                chuckle_prob_slider,
+                breathing_prob_slider,
             ],
             outputs=[
                 current_id_md,
@@ -2143,13 +2260,11 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
             jump_to_id,
             inputs=[
                 jump_id_input,
-                min_overall_prob_slider,
                 sigh_prob_slider,
-                sigh_duration_slider,
                 laughter_prob_slider,
                 laughter_duration_slider,
+                chuckle_prob_slider,
                 breathing_prob_slider,
-                breathing_duration_slider,
             ],
             outputs=[
                 current_id_md,
@@ -2160,94 +2275,58 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
                 jump_id_input,
             ],
         )
-        min_overall_prob_slider.change(
-            refresh_timeline,
-            inputs=[
-                min_overall_prob_slider,
-                sigh_prob_slider,
-                sigh_duration_slider,
-                laughter_prob_slider,
-                laughter_duration_slider,
-                breathing_prob_slider,
-                breathing_duration_slider,
-            ],
-            outputs=[timeline_md],
-        )
         sigh_prob_slider.change(
             refresh_timeline,
             inputs=[
-                min_overall_prob_slider,
                 sigh_prob_slider,
-                sigh_duration_slider,
                 laughter_prob_slider,
                 laughter_duration_slider,
+                chuckle_prob_slider,
                 breathing_prob_slider,
-                breathing_duration_slider,
-            ],
-            outputs=[timeline_md],
-        )
-        sigh_duration_slider.change(
-            refresh_timeline,
-            inputs=[
-                min_overall_prob_slider,
-                sigh_prob_slider,
-                sigh_duration_slider,
-                laughter_prob_slider,
-                laughter_duration_slider,
-                breathing_prob_slider,
-                breathing_duration_slider,
             ],
             outputs=[timeline_md],
         )
         laughter_prob_slider.change(
             refresh_timeline,
             inputs=[
-                min_overall_prob_slider,
                 sigh_prob_slider,
-                sigh_duration_slider,
                 laughter_prob_slider,
                 laughter_duration_slider,
+                chuckle_prob_slider,
                 breathing_prob_slider,
-                breathing_duration_slider,
             ],
             outputs=[timeline_md],
         )
         laughter_duration_slider.change(
             refresh_timeline,
             inputs=[
-                min_overall_prob_slider,
                 sigh_prob_slider,
-                sigh_duration_slider,
                 laughter_prob_slider,
                 laughter_duration_slider,
+                chuckle_prob_slider,
                 breathing_prob_slider,
-                breathing_duration_slider,
+            ],
+            outputs=[timeline_md],
+        )
+        chuckle_prob_slider.change(
+            refresh_timeline,
+            inputs=[
+                sigh_prob_slider,
+                laughter_prob_slider,
+                laughter_duration_slider,
+                chuckle_prob_slider,
+                breathing_prob_slider,
             ],
             outputs=[timeline_md],
         )
         breathing_prob_slider.change(
             refresh_timeline,
             inputs=[
-                min_overall_prob_slider,
                 sigh_prob_slider,
-                sigh_duration_slider,
                 laughter_prob_slider,
                 laughter_duration_slider,
+                chuckle_prob_slider,
                 breathing_prob_slider,
-                breathing_duration_slider,
-            ],
-            outputs=[timeline_md],
-        )
-        breathing_duration_slider.change(
-            refresh_timeline,
-            inputs=[
-                min_overall_prob_slider,
-                sigh_prob_slider,
-                sigh_duration_slider,
-                laughter_prob_slider,
-                laughter_duration_slider,
-                breathing_prob_slider,
-                breathing_duration_slider,
             ],
             outputs=[timeline_md],
         )

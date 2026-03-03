@@ -5,6 +5,7 @@ Joins by audio_path and writes only:
 - emotion_frames
 - omni_text
 - audio_tag_topk
+- audio_tag_frames
 - dialect_segment
 - dialect_segment_name
 - dialect_speaker_majority
@@ -95,7 +96,12 @@ def build_omni_index(path: Path) -> dict[str, str]:
 def build_tag_index(path: Path) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     for row in read_jsonl(path):
-        out[row["audio_path"]] = row["audio_tag_topk"]
+        payload: dict[str, Any] = {}
+        if "audio_tag_topk" in row and _is_present(row["audio_tag_topk"]):
+            payload["audio_tag_topk"] = row["audio_tag_topk"]
+        if "audio_tag_frames" in row and _is_present(row["audio_tag_frames"]):
+            payload["audio_tag_frames"] = row["audio_tag_frames"]
+        out[row["audio_path"]] = payload
     return out
 
 
@@ -205,11 +211,16 @@ def main() -> int:
             else:
                 merged["omni_text"] = omni_val
 
-            tags_val = tags_by_audio.get(akey)
-            if not _is_present(tags_val):
-                missing.append("audio_tag_topk")
+            tags_payload = tags_by_audio.get(akey, {})
+            has_topk = _is_present(tags_payload.get("audio_tag_topk"))
+            has_frames = _is_present(tags_payload.get("audio_tag_frames"))
+            if not (has_topk or has_frames):
+                missing.append("audio_tag_topk_or_audio_tag_frames")
             else:
-                merged["audio_tag_topk"] = tags_val
+                if has_topk:
+                    merged["audio_tag_topk"] = tags_payload["audio_tag_topk"]
+                if has_frames:
+                    merged["audio_tag_frames"] = tags_payload["audio_tag_frames"]
 
             dialect_payload = dialect_by_audio.get(akey)
             if dialect_payload is None:
@@ -246,7 +257,10 @@ def main() -> int:
                         merged[key] = value
 
             if missing:
-                if not args.skip_incomplete:
+                # Always drop rows that have neither legacy nor framewise tags.
+                # This keeps output manifests compatible with downstream browser tooling.
+                force_skip = "audio_tag_topk_or_audio_tag_frames" in missing
+                if (not args.skip_incomplete) and (not force_skip):
                     raise KeyError(
                         f"Missing data for audio_path='{akey}' at manifest line {line_num}: {', '.join(missing)}"
                     )
