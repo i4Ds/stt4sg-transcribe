@@ -19,6 +19,8 @@ import concurrent.futures
 import json
 import logging
 import os
+import random
+import re
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -129,6 +131,14 @@ def iter_json_files(root: Path) -> Iterable[Path]:
     for path in root.rglob("*.json"):
         if path.is_file():
             yield path
+
+
+def _safe_filename_token(value: Any, max_len: int = 80) -> str:
+    token = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or ""))
+    token = token.strip("._-")
+    if not token:
+        token = "na"
+    return token[:max_len]
 
 
 def _download_file(url: str, target_path: Path) -> None:
@@ -351,6 +361,15 @@ def passes_quality_filter(seg: Dict, config: FilterConfig) -> tuple[bool, str]:
     # Must have text
     if not seg.get("text", "").strip():
         return False, "empty text"
+
+    # Cheap pre-merge overlap guard (same threshold re-checked post-merge too).
+    non_main_time = _compute_non_main_time(seg)
+    if config.max_non_main_time is not None and non_main_time is not None:
+        if non_main_time > config.max_non_main_time:
+            return (
+                False,
+                f"non_main_time {non_main_time:.2f}s > {config.max_non_main_time}s",
+            )
 
     return True, ""
 
@@ -769,6 +788,8 @@ def process_json_file(
                 {
                     "stage": "quality_filter",
                     "reason": reason,
+                    "source_audio": audio_file,
+                    "source_json": str(json_path),
                     "segment": {
                         "start": seg.get("start"),
                         "end": seg.get("end"),
@@ -780,6 +801,7 @@ def process_json_file(
                         "purity": seg.get("purity"),
                         "coverage": seg.get("coverage"),
                         "avg_logprob": seg.get("avg_logprob"),
+                        "non_main_time": _compute_non_main_time(seg),
                     },
                 }
             )
@@ -806,6 +828,8 @@ def process_json_file(
                 {
                     "stage": "overlap_filter",
                     "reason": reason,
+                    "source_audio": audio_file,
+                    "source_json": str(json_path),
                     "segment": {
                         "start": seg.get("start"),
                         "end": seg.get("end"),
@@ -840,6 +864,8 @@ def process_json_file(
                 {
                     "stage": "duration_filter",
                     "reason": reason,
+                    "source_audio": audio_file,
+                    "source_json": str(json_path),
                     "segment": {
                         "start": seg.get("start"),
                         "end": seg.get("end"),
@@ -953,6 +979,8 @@ def process_json_file(
                     {
                         "stage": "post_cut_filter",
                         "reason": reason_post,
+                        "source_audio": audio_file,
+                        "source_json": str(json_path),
                         "segment": {
                             "start": seg.get("start"),
                             "end": seg.get("end"),
@@ -1262,10 +1290,19 @@ def main():
         "total_duration_out": 0.0,
         "speakers": {},
         "rejection_reasons": {},
+        "rejected_samples_written": 0,
     }
 
     jsonl_path = output_dir / "manifest.jsonl"
     rejected_path = output_dir / "rejected.jsonl"
+    rejected_samples_dir = output_dir / "_rejected_samples"
+    rejected_samples_dir.mkdir(parents=True, exist_ok=True)
+    rejected_sample_prob = 0.01
+    rejected_sample_limit = 50
+    rejected_sample_min_duration = float(config.min_duration)
+    rejected_sample_count = 0
+    rejected_sample_rng = random.Random()
+    rejected_audio_cache: Dict[str, AudioSegment] = {}
     manifest_mode = "w"
     logger.info(
         "Writing manifest incrementally to %s (%s mode)",
@@ -1273,6 +1310,16 @@ def main():
         "append" if manifest_mode == "a" else "write",
     )
     logger.info(f"Writing rejected segments incrementally to {rejected_path}")
+    logger.info(
+        "Writing sampled rejected audio to %s (p=%.2f, max=%d)",
+        rejected_samples_dir,
+        rejected_sample_prob,
+        rejected_sample_limit,
+    )
+    logger.info(
+        "Rejected sample criteria: reason in {avg_logprob, dnsmos_*}, duration >= %.2fs",
+        rejected_sample_min_duration,
+    )
 
     max_workers = int(args.workers)
     if max_workers > 1:
@@ -1284,6 +1331,82 @@ def main():
         open(jsonl_path, manifest_mode, encoding="utf-8") as manifest_f,
         open(rejected_path, "w", encoding="utf-8") as rejected_f,
     ):
+        def maybe_write_rejected_sample(rej: Dict[str, Any]) -> Optional[str]:
+            nonlocal rejected_sample_count
+            if rejected_sample_count >= rejected_sample_limit:
+                return None
+
+            stage = str(rej.get("stage") or "")
+            reason = str(rej.get("reason") or "")
+            reason_l = reason.lower()
+            is_avg_logprob_reject = stage == "quality_filter" and "avg_logprob" in reason_l
+            is_dnsmos_reject = stage == "post_cut_filter" and "dnsmos_" in reason_l
+            if not (is_avg_logprob_reject or is_dnsmos_reject):
+                return None
+
+            source_audio = rej.get("source_audio")
+            seg = rej.get("segment") if isinstance(rej.get("segment"), dict) else None
+            if not source_audio or seg is None:
+                return None
+
+            try:
+                start = float(seg.get("start"))
+                end = float(seg.get("end"))
+            except Exception:
+                return None
+            if not np.isfinite(start) or not np.isfinite(end) or end <= start:
+                return None
+            seg_duration = float(seg.get("duration", end - start) or (end - start))
+            if seg_duration < rejected_sample_min_duration:
+                return None
+            if rejected_sample_rng.random() >= rejected_sample_prob:
+                return None
+
+            source_path = Path(str(source_audio))
+            if not source_path.exists():
+                return None
+            source_key = str(source_path.resolve())
+
+            audio = rejected_audio_cache.get(source_key)
+            if audio is None:
+                try:
+                    audio = AudioSegment.from_file(source_key)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to load source audio for rejected sample %s: %s",
+                        source_key,
+                        exc,
+                    )
+                    return None
+                rejected_audio_cache[source_key] = audio
+
+            stage = _safe_filename_token(stage or "rejected", max_len=24)
+            source_stem = _safe_filename_token(source_path.stem, max_len=48)
+            start_str = f"{start:.2f}".replace(".", "_")
+            end_str = f"{end:.2f}".replace(".", "_")
+            sample_idx = rejected_sample_count + 1
+            sample_name = (
+                f"rej_{sample_idx:03d}_{stage}_{source_stem}_{start_str}-{end_str}."
+                f"{args.audio_format}"
+            )
+            sample_path = rejected_samples_dir / sample_name
+
+            success, _ = cut_audio_segment(
+                audio=audio,
+                start=start,
+                end=end,
+                output_path=sample_path,
+                format=args.audio_format,
+                frame_ms=args.frame_ms,
+                cut_pad_start_ms=args.cut_pad_start_ms,
+                cut_pad_end_ms=args.cut_pad_end_ms,
+            )
+            if not success or not sample_path.exists():
+                return None
+
+            rejected_sample_count += 1
+            stats["rejected_samples_written"] = rejected_sample_count
+            return str(sample_path.resolve())
 
         def persist_and_update(
             segments: List[Dict], rejected: List[Dict], input_stats: Dict[str, Any]
@@ -1293,7 +1416,11 @@ def main():
                 manifest_f.write(json.dumps(seg, ensure_ascii=False) + "\n")
                 written_segments += 1
             for rej in rejected:
-                rejected_f.write(json.dumps(rej, ensure_ascii=False) + "\n")
+                rej_out = dict(rej)
+                sample_audio_path = maybe_write_rejected_sample(rej_out)
+                if sample_audio_path:
+                    rej_out["sample_audio_path"] = sample_audio_path
+                rejected_f.write(json.dumps(rej_out, ensure_ascii=False) + "\n")
             manifest_f.flush()
             rejected_f.flush()
 
