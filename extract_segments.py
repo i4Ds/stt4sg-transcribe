@@ -19,6 +19,7 @@ import concurrent.futures
 import json
 import logging
 import os
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -28,7 +29,7 @@ import numpy as np
 from pydub import AudioSegment
 
 logger = logging.getLogger("extract_segments")
-_RESUME_AUDIO_KEYS: Optional[set[str]] = None
+_DNSMOS_SCORER: Optional["DNSMOSScorer"] = None
 
 
 @dataclass
@@ -49,6 +50,14 @@ class FilterConfig:
     # a segment. If the sum of all other speakers' overlap time exceeds this
     # threshold the segment is rejected.
     max_non_main_time: float = 0.5
+    # Post-cut audio checks
+    reject_clipped: bool = False
+    clip_sample_threshold: float = 0.999
+    max_clip_ratio: float = 0.002
+    # DNSMOS gates (optional)
+    min_dnsmos_sig: Optional[float] = None
+    min_dnsmos_bak: Optional[float] = None
+    dnsmos_sig_bak_ovr_model: Optional[str] = None
 
 
 @dataclass
@@ -79,10 +88,8 @@ class SegmentInfo:
     speaker_overlaps: Optional[Dict[str, float]] = None
     # Total time (s) of non-main speakers overlapping this segment
     non_main_time: Optional[float] = None
-
-    # Word-level info (optional)
-    words: Optional[List[Dict]] = None
-    avg_word_score: Optional[float] = None
+    # Word-level timestamps normalized to segment-local time
+    words: Optional[List[Dict[str, Any]]] = None
 
     # Merge info
     is_merged: bool = False
@@ -106,7 +113,7 @@ class SegmentInfo:
             "compression_ratio": self.compression_ratio,
             "speaker_overlaps": self.speaker_overlaps,
             "non_main_time": self.non_main_time,
-            "avg_word_score": self.avg_word_score,
+            "words": self.words,
             "is_merged": self.is_merged,
             "merge_count": self.merge_count,
             "source_metrics": self.source_metrics,
@@ -114,7 +121,6 @@ class SegmentInfo:
             "source_audio": self.source_audio,
             "source_json": self.source_json,
         }
-        # Don't include words in JSONL to keep it compact
         return {k: v for k, v in d.items() if v is not None}
 
 
@@ -125,50 +131,171 @@ def iter_json_files(root: Path) -> Iterable[Path]:
             yield path
 
 
-def _normalize_audio_key(path_value: str) -> str:
-    """Normalize audio_path values for robust dedupe checks."""
-    if not path_value:
-        return ""
-    if path_value.startswith("<dry-run>/"):
-        return path_value
-    try:
-        return str(Path(path_value).resolve())
-    except Exception:
-        return path_value
+def _download_file(url: str, target_path: Path) -> None:
+    """Download file to target path atomically."""
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_path.with_suffix(target_path.suffix + ".tmp")
+    urllib.request.urlretrieve(url, tmp_path)  # nosec B310
+    tmp_path.replace(target_path)
 
 
-def _load_processed_audio_keys(manifest_path: Path) -> set[str]:
-    """Load already written audio paths from an existing manifest."""
-    processed: set[str] = set()
-    if not manifest_path.exists():
-        return processed
+def _ensure_dnsmos_model(model_dir: Path) -> Path:
+    """
+    Ensure DNSMOS ONNX models are present locally.
 
-    with open(manifest_path, "r", encoding="utf-8") as f:
-        for line_num, line in enumerate(f, start=1):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            try:
-                entry = json.loads(stripped)
-            except json.JSONDecodeError as exc:
-                logger.warning(
-                    "Ignoring manifest line %d during resume: JSON decode error: %s",
-                    line_num,
-                    exc,
-                )
-                continue
-            audio_path = entry.get("audio_path")
-            if isinstance(audio_path, str):
-                key = _normalize_audio_key(audio_path)
-                if key:
-                    processed.add(key)
-    return processed
+    Sources:
+      - https://github.com/microsoft/DNS-Challenge/tree/master/DNSMOS
+    """
+    sig_bak_ovr_model = model_dir / "sig_bak_ovr.onnx"
+
+    if not sig_bak_ovr_model.exists():
+        logger.info("Downloading DNSMOS model: %s", sig_bak_ovr_model)
+        _download_file(
+            "https://raw.githubusercontent.com/microsoft/DNS-Challenge/master/DNSMOS/DNSMOS/sig_bak_ovr.onnx",
+            sig_bak_ovr_model,
+        )
+    return sig_bak_ovr_model
 
 
-def _init_resume_audio_keys(keys: set[str]) -> None:
-    """Initializer for process workers."""
-    global _RESUME_AUDIO_KEYS
-    _RESUME_AUDIO_KEYS = keys
+class DNSMOSScorer:
+    """DNSMOS scorer backed by ONNX models from Microsoft's DNS-Challenge."""
+
+    sample_rate = 16000
+    input_length = 9.01
+
+    @staticmethod
+    def _ort_thread_config() -> tuple[int, int]:
+        """
+        Return (intra_op_threads, inter_op_threads) for ONNXRuntime sessions.
+
+        Defaults to 1/1 to avoid ORT auto-affinity issues on some SLURM nodes.
+        Override with env vars:
+          - STT4SG_ORT_INTRA_OP_THREADS or ORT_INTRA_OP_NUM_THREADS
+          - STT4SG_ORT_INTER_OP_THREADS or ORT_INTER_OP_NUM_THREADS
+        """
+        intra_raw = os.getenv("STT4SG_ORT_INTRA_OP_THREADS") or os.getenv(
+            "ORT_INTRA_OP_NUM_THREADS"
+        )
+        inter_raw = os.getenv("STT4SG_ORT_INTER_OP_THREADS") or os.getenv(
+            "ORT_INTER_OP_NUM_THREADS"
+        )
+        try:
+            intra = max(1, int(intra_raw)) if intra_raw else 1
+        except Exception:
+            intra = 1
+        try:
+            inter = max(1, int(inter_raw)) if inter_raw else 1
+        except Exception:
+            inter = 1
+        return intra, inter
+
+    def __init__(self, sig_bak_ovr_model: Path):
+        try:
+            import onnxruntime as ort
+        except Exception as exc:
+            raise RuntimeError(
+                "onnxruntime is required for DNSMOS filtering. "
+                "Install it before enabling --min-dnsmos-* filters."
+            ) from exc
+
+        providers = ["CPUExecutionProvider"]
+        intra_threads, inter_threads = self._ort_thread_config()
+        sess_options = ort.SessionOptions()
+        sess_options.intra_op_num_threads = intra_threads
+        sess_options.inter_op_num_threads = inter_threads
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        self.sig_bak_ovr_sess = ort.InferenceSession(
+            str(sig_bak_ovr_model),
+            sess_options=sess_options,
+            providers=providers,
+        )
+        self.sig_bak_ovr_input = self.sig_bak_ovr_sess.get_inputs()[0].name
+        logger.info(
+            "DNSMOS ORT threads: intra_op=%d inter_op=%d", intra_threads, inter_threads
+        )
+
+        # Non-personalized polynomial calibration from dnsmos_local.py.
+        self._sig_poly = np.poly1d([-0.08397278, 1.22083953, 0.0052439])
+        self._bak_poly = np.poly1d([-0.13166888, 1.60915514, -0.39604546])
+
+    @staticmethod
+    def _to_mono_1d(y: np.ndarray) -> np.ndarray:
+        """Normalize waveform shape to (num_samples,) robustly."""
+        arr = np.asarray(y)
+        if arr.ndim == 1:
+            return arr.astype(np.float32, copy=False)
+        if arr.ndim != 2:
+            raise ValueError(f"Unsupported waveform rank: {arr.ndim}")
+
+        if 1 in arr.shape:
+            return arr.reshape(-1).astype(np.float32, copy=False)
+
+        # Handle both (channels, samples) and (samples, channels).
+        if arr.shape[0] <= 8 and arr.shape[1] > 8:
+            mono = arr.mean(axis=0)
+        elif arr.shape[1] <= 8 and arr.shape[0] > 8:
+            mono = arr.mean(axis=1)
+        else:
+            raise ValueError(
+                f"Ambiguous 2D waveform shape {arr.shape}; expected channels axis <= 8"
+            )
+        return mono.astype(np.float32, copy=False)
+
+    @staticmethod
+    def _center_window(y: np.ndarray, samples_needed: int) -> np.ndarray:
+        """Take centered window after repeating if needed."""
+        if y.size == 0:
+            raise ValueError("empty waveform")
+        if y.shape[0] < samples_needed:
+            repeats = int(np.ceil(samples_needed / y.shape[0])) + 2
+            y = np.tile(y, repeats)
+        start = (y.shape[0] - samples_needed) // 2
+        end = start + samples_needed
+        return y[start:end]
+
+    def score_waveform(self, y: np.ndarray, sr: int) -> Dict[str, float]:
+        y = self._to_mono_1d(y)
+        if y.size == 0:
+            raise ValueError("empty waveform")
+
+        if sr != self.sample_rate:
+            y = librosa.resample(y, orig_sr=sr, target_sr=self.sample_rate)
+            sr = self.sample_rate
+
+        peak = float(np.max(np.abs(y)))
+        if peak > 1.0:
+            y = y / peak
+
+        samples_needed = int(self.input_length * sr)
+        segment = self._center_window(y, samples_needed).astype(np.float32, copy=False)
+        if segment.shape[0] != samples_needed:
+            raise RuntimeError("DNSMOS failed: invalid segment length after center crop")
+
+        raw_sig, raw_bak, _raw_ovr = self.sig_bak_ovr_sess.run(
+            None, {self.sig_bak_ovr_input: np.array([segment], dtype=np.float32)}
+        )[0][0]
+        sig_mos = float(self._sig_poly(raw_sig))
+        bak_mos = float(self._bak_poly(raw_bak))
+        return {
+            "dnsmos_sig": round(sig_mos, 4),
+            "dnsmos_bak": round(bak_mos, 4),
+        }
+
+
+def _get_dnsmos_scorer(config: FilterConfig) -> Optional[DNSMOSScorer]:
+    """Lazy-load DNSMOS scorer once per process."""
+    if config.min_dnsmos_sig is None and config.min_dnsmos_bak is None:
+        return None
+
+    if not config.dnsmos_sig_bak_ovr_model:
+        raise RuntimeError("DNSMOS models are not configured")
+
+    global _DNSMOS_SCORER
+    if _DNSMOS_SCORER is None:
+        _DNSMOS_SCORER = DNSMOSScorer(
+            sig_bak_ovr_model=Path(config.dnsmos_sig_bak_ovr_model),
+        )
+    return _DNSMOS_SCORER
 
 
 def load_segments_from_json(json_path: Path) -> tuple[str, List[Dict]]:
@@ -225,24 +352,68 @@ def passes_quality_filter(seg: Dict, config: FilterConfig) -> tuple[bool, str]:
     if not seg.get("text", "").strip():
         return False, "empty text"
 
-    # Check total overlap time from non-main speakers (if available)
-    overlaps = seg.get("speaker_overlaps") or {}
-    if overlaps and config.max_non_main_time is not None:
-        main = seg.get("speaker")
-        try:
-            non_main_time = sum(
-                float(t) for s, t in overlaps.items() if s != main and t is not None
-            )
-        except Exception:
-            non_main_time = 0.0
-
-        if non_main_time > config.max_non_main_time:
-            return (
-                False,
-                f"non_main_time {non_main_time:.2f}s > {config.max_non_main_time}s",
-            )
-
     return True, ""
+
+
+def _compute_non_main_time(seg: Dict[str, Any]) -> Optional[float]:
+    """Compute total overlap duration from speakers other than the main speaker."""
+    overlaps = seg.get("speaker_overlaps") or {}
+    if not overlaps:
+        return None
+    main = seg.get("speaker")
+    try:
+        return float(
+            sum(float(t) for s, t in overlaps.items() if s != main and t is not None)
+        )
+    except Exception:
+        return None
+
+
+def passes_non_main_overlap_filter(
+    seg: Dict[str, Any], config: FilterConfig
+) -> tuple[bool, str]:
+    """Apply max_non_main_time constraint after merging."""
+    non_main_time = _compute_non_main_time(seg)
+    if config.max_non_main_time is None or non_main_time is None:
+        return True, ""
+    if non_main_time > config.max_non_main_time:
+        return (
+            False,
+            f"non_main_time {non_main_time:.2f}s > {config.max_non_main_time}s",
+        )
+    return True, ""
+
+
+def normalize_words_to_segment(seg: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """Normalize word start/end to segment-local timestamps."""
+    words = seg.get("words")
+    if not isinstance(words, list) or not words:
+        return None
+
+    seg_start = float(seg.get("start", 0.0) or 0.0)
+    seg_duration = float(seg.get("duration", seg.get("end", 0.0) - seg_start) or 0.0)
+    out: List[Dict[str, Any]] = []
+
+    for word in words:
+        if not isinstance(word, dict):
+            continue
+        item = dict(word)
+
+        w_start = item.get("start")
+        w_end = item.get("end")
+        if w_start is not None:
+            rel_start = max(0.0, float(w_start) - seg_start)
+            if seg_duration > 0:
+                rel_start = min(rel_start, seg_duration)
+            item["start"] = round(rel_start, 4)
+        if w_end is not None:
+            rel_end = max(0.0, float(w_end) - seg_start)
+            if seg_duration > 0:
+                rel_end = min(rel_end, seg_duration)
+            item["end"] = round(rel_end, 4)
+        out.append(item)
+
+    return out or None
 
 
 def passes_duration_filter(seg: Dict, config: FilterConfig) -> tuple[bool, str]:
@@ -259,23 +430,6 @@ def passes_duration_filter(seg: Dict, config: FilterConfig) -> tuple[bool, str]:
         return False, f"duration {duration:.2f}s > {config.max_duration}s"
 
     return True, ""
-
-
-def calculate_avg_word_score(seg: Dict) -> Optional[float]:
-    """Calculate average word alignment score from segment."""
-    words = seg.get("words", [])
-    if not words:
-        return None
-
-    scores = [
-        w.get("score") or w.get("probability")
-        for w in words
-        if w.get("score") or w.get("probability")
-    ]
-    if not scores:
-        return None
-
-    return round(sum(scores) / len(scores), 4)
 
 
 def attach_diarization_metrics(
@@ -493,78 +647,58 @@ def _audiosegment_to_mono_float32(audio: AudioSegment) -> tuple[np.ndarray, int]
     return y, int(audio.frame_rate)
 
 
-def _compute_segment_metrics(
-    audio: AudioSegment,
-    frame_ms: int = 20,
-    eps: float = 1e-9,
+def _compute_basic_audio_metrics(
+    y: np.ndarray,
+    sr: int,
+    clip_sample_threshold: float,
 ) -> Dict[str, Any]:
-    """
-    Compute cheap per-segment metrics from the final cut waveform.
-
-    Metrics:
-      - snr_db (signal RMS vs lowest 10% RMS noise proxy)
-      - music heuristic using spectral flatness + harmonic ratio (librosa HPSS)
-    """
-    y, sr = _audiosegment_to_mono_float32(audio)
+    """Compute lightweight post-cut waveform checks."""
     if y.size == 0:
-        return {"error": "empty_audio"}
+        return {"audio_empty": True, "sample_rate": int(sr), "num_samples": 0}
 
-    frame_len = max(1, int(sr * frame_ms / 1000))
-    n_frames = int(np.ceil(y.size / frame_len))
-    pad = n_frames * frame_len - y.size
-    if pad > 0:
-        y = np.pad(y, (0, pad))
-    frames = y.reshape(n_frames, frame_len)
-
-    rms = np.sqrt(np.mean(np.square(frames), axis=1) + eps)
-    signal_rms = float(np.median(rms))
-    k = max(1, int(0.1 * rms.size))
-    lowest = np.partition(rms, k - 1)[:k]
-    noise_rms = float(np.median(lowest))
-    noise_method = "lowest_10pct_rms_proxy"
-    snr_db = float(20.0 * np.log10((signal_rms + eps) / (noise_rms + eps)))
-
-    max_eval_frames = 4000
-    if frames.shape[0] > max_eval_frames:
-        idx = np.linspace(0, frames.shape[0] - 1, max_eval_frames, dtype=int)
-        frames = frames[idx]
-
-    window = np.hanning(frame_len).astype(np.float32)
-    spectrum = np.fft.rfft(frames * window[None, :], axis=1)
-    power = (np.abs(spectrum) ** 2) + eps
-    flatness_arr = np.exp(np.mean(np.log(power), axis=1)) / np.mean(power, axis=1)
-    music_flatness = float(np.median(flatness_arr))
-
-    music_wave = frames.reshape(-1)
-    stft = librosa.stft(music_wave, n_fft=1024, hop_length=256, center=False)
-    mag = np.abs(stft)
-    harmonic_mag, percussive_mag = librosa.decompose.hpss(mag)
-    harmonic_energy = float(np.sum(harmonic_mag**2))
-    percussive_energy = float(np.sum(percussive_mag**2))
-    harm_ratio = float(harmonic_energy / (percussive_energy + eps))
-    harm_ratio_method = "librosa_hpss"
-
-    harm_component = harm_ratio / (harm_ratio + 1.0)
-    tonal_component = 1.0 - float(np.clip(music_flatness, 0.0, 1.0))
-    music_score = float(np.clip(harm_component * tonal_component, 0.0, 1.0))
-    music_likely = bool(harm_ratio > 1.5 and music_flatness < 0.35)
-    eval_frames = int(frames.shape[0])
-
+    clip_ratio = float(np.mean(np.abs(y) >= clip_sample_threshold))
     return {
-        "analysis_frame_ms": int(frame_ms),
-        "signal_rms": round(signal_rms, 8),
-        "noise_rms": round(noise_rms, 8),
-        "noise_rms_method": noise_method,
-        "snr_db": round(snr_db, 3),
-        "music_eval_frame_count": eval_frames,
-        "music_flatness": (
-            round(music_flatness, 6) if music_flatness is not None else None
-        ),
-        "music_harm_ratio": round(harm_ratio, 6) if harm_ratio is not None else None,
-        "music_harm_ratio_method": harm_ratio_method,
-        "music_score": round(music_score, 6) if music_score is not None else None,
-        "music_likely": music_likely,
+        "audio_empty": False,
+        "sample_rate": int(sr),
+        "num_samples": int(y.size),
+        "clip_sample_threshold": round(float(clip_sample_threshold), 6),
+        "clip_ratio": round(clip_ratio, 8),
     }
+
+
+def _passes_post_cut_filter(
+    metrics: Dict[str, Any], config: FilterConfig
+) -> tuple[bool, str]:
+    """Apply optional post-cut DSP and DNSMOS gates."""
+    if metrics.get("audio_empty"):
+        return False, "empty audio after cutting"
+
+    clip_ratio = metrics.get("clip_ratio")
+    if config.reject_clipped:
+        if clip_ratio is None:
+            return False, "clip_ratio missing"
+        if clip_ratio > config.max_clip_ratio:
+            return (
+                False,
+                f"clip_ratio {clip_ratio:.6f} > {config.max_clip_ratio} "
+                f"(threshold={config.clip_sample_threshold})",
+            )
+
+    sig = metrics.get("dnsmos_sig")
+    if config.min_dnsmos_sig is not None:
+        if sig is None:
+            return False, "dnsmos_sig missing"
+        if sig < config.min_dnsmos_sig:
+            return False, f"dnsmos_sig {sig:.2f} < {config.min_dnsmos_sig}"
+
+    bak = metrics.get("dnsmos_bak")
+    if config.min_dnsmos_bak is not None:
+        if bak is None:
+            return False, "dnsmos_bak missing"
+        if bak < config.min_dnsmos_bak:
+            return False, f"dnsmos_bak {bak:.2f} < {config.min_dnsmos_bak}"
+
+    return True, ""
 
 
 def process_json_file(
@@ -577,7 +711,6 @@ def process_json_file(
     frame_ms: int,
     cut_pad_start_ms: int,
     cut_pad_end_ms: int,
-    processed_audio_keys: Optional[set[str]] = None,
 ) -> tuple[List[Dict], List[Dict], Dict]:
     """
     Process a single JSON file and extract segments.
@@ -632,15 +765,6 @@ def process_json_file(
         if passed:
             quality_passed.append(seg)
         else:
-            # compute non_main_time for logging/storage
-            overlaps = seg.get("speaker_overlaps") or {}
-            main = seg.get("speaker")
-            try:
-                non_main_time = sum(
-                    float(t) for s, t in overlaps.items() if s != main and t is not None
-                )
-            except Exception:
-                non_main_time = None
             rejected.append(
                 {
                     "stage": "quality_filter",
@@ -656,7 +780,6 @@ def process_json_file(
                         "purity": seg.get("purity"),
                         "coverage": seg.get("coverage"),
                         "avg_logprob": seg.get("avg_logprob"),
-                        "non_main_time": non_main_time,
                     },
                 }
             )
@@ -672,9 +795,43 @@ def process_json_file(
     else:
         merged = quality_passed
 
-    # Step 3: Filter by duration AFTER merging
-    final = []
+    # Step 3: Filter by non-main overlap AFTER merging
+    overlap_passed = []
     for seg in merged:
+        passed, reason = passes_non_main_overlap_filter(seg, config)
+        if passed:
+            overlap_passed.append(seg)
+        else:
+            rejected.append(
+                {
+                    "stage": "overlap_filter",
+                    "reason": reason,
+                    "segment": {
+                        "start": seg.get("start"),
+                        "end": seg.get("end"),
+                        "duration": seg.get(
+                            "duration", seg.get("end", 0) - seg.get("start", 0)
+                        ),
+                        "text": seg.get("text", "")[:100],
+                        "speaker": seg.get("speaker"),
+                        "purity": seg.get("purity"),
+                        "coverage": seg.get("coverage"),
+                        "non_main_time": _compute_non_main_time(seg),
+                        "is_merged": seg.get("_is_merged", False),
+                        "merge_count": seg.get("_merge_count", 1),
+                    },
+                }
+            )
+    logger.info(
+        "  Overlap filter: %d -> %d segments", len(merged), len(overlap_passed)
+    )
+
+    if not overlap_passed:
+        return [], rejected, input_stats
+
+    # Step 4: Filter by duration AFTER merging/overlap filtering
+    final = []
+    for seg in overlap_passed:
         passed, reason = passes_duration_filter(seg, config)
         if passed:
             final.append(seg)
@@ -693,12 +850,13 @@ def process_json_file(
                         "speaker": seg.get("speaker"),
                         "purity": seg.get("purity"),
                         "coverage": seg.get("coverage"),
+                        "non_main_time": _compute_non_main_time(seg),
                         "is_merged": seg.get("_is_merged", False),
                         "merge_count": seg.get("_merge_count", 1),
                     },
                 }
             )
-    logger.info(f"  Duration filter: {len(merged)} -> {len(final)} segments")
+    logger.info(f"  Duration filter: {len(overlap_passed)} -> {len(final)} segments")
 
     if not final:
         return [], rejected, input_stats
@@ -719,28 +877,13 @@ def process_json_file(
     # Sort final segments by start time for proper cutting
     final = sorted(final, key=lambda s: s.get("start", 0))
 
-    # Resolve resume keys (worker-local in multiprocessing mode).
-    if processed_audio_keys is None:
-        processed_audio_keys = _RESUME_AUDIO_KEYS or set()
-
     pending: List[tuple[Dict, Path]] = []
     for seg in final:
         start_str = f"{seg['start']:.2f}".replace(".", "_")
         end_str = f"{seg['end']:.2f}".replace(".", "_")
         segment_filename = f"{source_stem}_{start_str}-{end_str}.{audio_format}"
         segment_path = segment_dir / segment_filename
-        key = _normalize_audio_key(str(segment_path))
-        if key and key in processed_audio_keys:
-            continue
         pending.append((seg, segment_path))
-
-    if not pending:
-        logger.info(
-            "Skipping %s: all %d candidate segments already in manifest",
-            json_path,
-            len(final),
-        )
-        return [], [], input_stats
 
     # Load audio once for pending segments
     audio = None
@@ -758,6 +901,7 @@ def process_json_file(
 
         # Cut audio with frame-aligned boundaries (Silero uses 32ms frames)
         segment_metrics = None
+        cut_segment = None
         if not dry_run and audio:
             success, cut_segment = cut_audio_segment(
                 audio,
@@ -771,10 +915,64 @@ def process_json_file(
             )
             if not success:
                 continue
-            if cut_segment is not None:
-                segment_metrics = _compute_segment_metrics(
-                    cut_segment, frame_ms=frame_ms
+            if cut_segment is None:
+                continue
+
+            y, sr = _audiosegment_to_mono_float32(cut_segment)
+            segment_metrics = _compute_basic_audio_metrics(
+                y,
+                sr,
+                clip_sample_threshold=config.clip_sample_threshold,
+            )
+            segment_metrics["max_clip_ratio"] = round(float(config.max_clip_ratio), 8)
+            segment_metrics["is_clipped"] = bool(
+                segment_metrics.get("clip_ratio", 0.0) > config.max_clip_ratio
+            )
+
+            dnsmos_scorer = _get_dnsmos_scorer(config)
+            if dnsmos_scorer is not None:
+                try:
+                    segment_metrics.update(dnsmos_scorer.score_waveform(y, sr))
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"DNSMOS scoring failed for {segment_path}: {exc}"
+                    ) from exc
+
+            passed_post, reason_post = _passes_post_cut_filter(segment_metrics, config)
+            if not passed_post:
+                try:
+                    if segment_path.exists():
+                        segment_path.unlink()
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to delete rejected segment file %s: %s",
+                        segment_path,
+                        exc,
+                    )
+                rejected.append(
+                    {
+                        "stage": "post_cut_filter",
+                        "reason": reason_post,
+                        "segment": {
+                            "start": seg.get("start"),
+                            "end": seg.get("end"),
+                            "duration": seg.get(
+                                "duration", seg.get("end", 0) - seg.get("start", 0)
+                            ),
+                            "text": seg.get("text", "")[:100],
+                            "speaker": seg.get("speaker"),
+                            "clip_ratio": segment_metrics.get("clip_ratio"),
+                            "clip_sample_threshold": segment_metrics.get(
+                                "clip_sample_threshold"
+                            ),
+                            "max_clip_ratio": segment_metrics.get("max_clip_ratio"),
+                            "is_clipped": segment_metrics.get("is_clipped"),
+                            "dnsmos_sig": segment_metrics.get("dnsmos_sig"),
+                            "dnsmos_bak": segment_metrics.get("dnsmos_bak"),
+                        },
+                    }
                 )
+                continue
 
         # Create segment info
         info = SegmentInfo(
@@ -791,17 +989,8 @@ def process_json_file(
             no_speech_prob=seg.get("no_speech_prob"),
             compression_ratio=seg.get("compression_ratio"),
             speaker_overlaps=seg.get("speaker_overlaps"),
-            non_main_time=(
-                sum(
-                    float(t)
-                    for s, t in (seg.get("speaker_overlaps") or {}).items()
-                    if s != seg.get("speaker") and t is not None
-                )
-                if seg.get("speaker_overlaps")
-                else None
-            ),
-            words=seg.get("words"),
-            avg_word_score=calculate_avg_word_score(seg),
+            non_main_time=_compute_non_main_time(seg),
+            words=normalize_words_to_segment(seg),
             is_merged=seg.get("_is_merged", False),
             merge_count=seg.get("_merge_count", 1),
             source_metrics=segment_metrics,
@@ -895,6 +1084,47 @@ def main():
         default=0.5,
         help="Maximum total time (s) of non-main speakers overlapping a segment",
     )
+    parser.add_argument(
+        "--reject-clipped",
+        action="store_true",
+        help="Enable clip-ratio rejection on cut audio",
+    )
+    parser.add_argument(
+        "--clip-sample-threshold",
+        type=float,
+        default=0.999,
+        help="Absolute sample level counted as clipped for clip-ratio",
+    )
+    parser.add_argument(
+        "--max-clip-ratio",
+        type=float,
+        default=0.002,
+        help="Maximum allowed clipped-sample ratio when --reject-clipped is enabled",
+    )
+    parser.add_argument(
+        "--min-dnsmos-sig",
+        type=float,
+        default=None,
+        help="Optional minimum DNSMOS SIG score (post-cut filter)",
+    )
+    parser.add_argument(
+        "--min-dnsmos-bak",
+        type=float,
+        default=None,
+        help="Optional minimum DNSMOS BAK score (post-cut filter)",
+    )
+    parser.add_argument(
+        "--dnsmos-model-dir",
+        type=Path,
+        default=Path.home() / ".cache" / "dnsmos",
+        help="Directory for DNSMOS ONNX models (auto-downloaded if missing)",
+    )
+    parser.add_argument(
+        "--dnsmos-sig-bak-ovr-model",
+        type=Path,
+        default=None,
+        help="Path to DNSMOS sig_bak_ovr.onnx (overrides auto-download)",
+    )
 
     # Other options
     parser.add_argument(
@@ -952,6 +1182,21 @@ def main():
         raise SystemExit(f"Input directory not found: {input_dir}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.clip_sample_threshold <= 0.0 or args.clip_sample_threshold > 1.0:
+        raise SystemExit("--clip-sample-threshold must be in (0, 1].")
+    if args.max_clip_ratio < 0.0 or args.max_clip_ratio > 1.0:
+        raise SystemExit("--max-clip-ratio must be in [0, 1].")
+
+    dnsmos_sig_bak_ovr_model: Optional[Path] = None
+    dnsmos_enabled = args.min_dnsmos_sig is not None or args.min_dnsmos_bak is not None
+    if dnsmos_enabled and not args.dry_run:
+        if args.dnsmos_sig_bak_ovr_model:
+            dnsmos_sig_bak_ovr_model = args.dnsmos_sig_bak_ovr_model.resolve()
+        else:
+            dnsmos_sig_bak_ovr_model = _ensure_dnsmos_model(args.dnsmos_model_dir.resolve())
+
+        if not dnsmos_sig_bak_ovr_model.exists():
+            raise SystemExit("DNSMOS model file is missing after setup.")
 
     # Build filter config
     config = FilterConfig(
@@ -964,6 +1209,14 @@ def main():
         merge_same_speaker=args.merge,
         max_pause_for_merge=args.max_pause,
         max_non_main_time=args.max_non_main_time,
+        reject_clipped=args.reject_clipped,
+        clip_sample_threshold=args.clip_sample_threshold,
+        max_clip_ratio=args.max_clip_ratio,
+        min_dnsmos_sig=args.min_dnsmos_sig,
+        min_dnsmos_bak=args.min_dnsmos_bak,
+        dnsmos_sig_bak_ovr_model=(
+            str(dnsmos_sig_bak_ovr_model) if dnsmos_sig_bak_ovr_model else None
+        ),
     )
 
     logger.info(
@@ -975,6 +1228,18 @@ def main():
         f"Merge config: enabled={config.merge_same_speaker}, max_pause={config.max_pause_for_merge}s, "
         f"max_dur={config.max_duration}s"
     )
+    if config.reject_clipped:
+        logger.info(
+            "Clip filter enabled: clip_ratio <= %s (sample_threshold=%s)",
+            config.max_clip_ratio,
+            config.clip_sample_threshold,
+        )
+    if dnsmos_enabled:
+        logger.info(
+            "DNSMOS filters enabled: min_sig=%s, min_bak=%s",
+            config.min_dnsmos_sig,
+            config.min_dnsmos_bak,
+        )
 
     # Find all JSON files
     json_files = sorted(iter_json_files(input_dir))
@@ -1001,13 +1266,11 @@ def main():
 
     jsonl_path = output_dir / "manifest.jsonl"
     rejected_path = output_dir / "rejected.jsonl"
-    processed_audio_keys = _load_processed_audio_keys(jsonl_path)
-    manifest_mode = "a" if jsonl_path.exists() else "w"
+    manifest_mode = "w"
     logger.info(
-        "Writing manifest incrementally to %s (%s mode, %d existing audio paths)",
+        "Writing manifest incrementally to %s (%s mode)",
         jsonl_path,
         "append" if manifest_mode == "a" else "write",
-        len(processed_audio_keys),
     )
     logger.info(f"Writing rejected segments incrementally to {rejected_path}")
 
@@ -1026,15 +1289,8 @@ def main():
             segments: List[Dict], rejected: List[Dict], input_stats: Dict[str, Any]
         ) -> None:
             written_segments = 0
-            written_audio_keys: set[str] = set()
             for seg in segments:
-                audio_key = _normalize_audio_key(str(seg.get("audio_path", "")))
-                if audio_key and audio_key in processed_audio_keys:
-                    continue
                 manifest_f.write(json.dumps(seg, ensure_ascii=False) + "\n")
-                if audio_key:
-                    processed_audio_keys.add(audio_key)
-                    written_audio_keys.add(audio_key)
                 written_segments += 1
             for rej in rejected:
                 rejected_f.write(json.dumps(rej, ensure_ascii=False) + "\n")
@@ -1048,9 +1304,6 @@ def main():
             stats["total_rejected"] += len(rejected)
 
             for seg in segments:
-                audio_key = _normalize_audio_key(str(seg.get("audio_path", "")))
-                if audio_key and audio_key not in written_audio_keys:
-                    continue
                 stats["total_duration_out"] += seg.get("duration", 0)
                 speaker = seg.get("speaker", "UNKNOWN")
                 stats["speakers"][speaker] = stats["speakers"].get(speaker, 0) + 1
@@ -1075,10 +1328,11 @@ def main():
                         frame_ms=args.frame_ms,
                         cut_pad_start_ms=args.cut_pad_start_ms,
                         cut_pad_end_ms=args.cut_pad_end_ms,
-                        processed_audio_keys=processed_audio_keys,
                     )
                 except Exception as e:
                     logger.exception(f"Error processing {json_path}: {e}")
+                    if dnsmos_enabled:
+                        raise
                     continue
                 segments, rejected, input_stats = result
                 persist_and_update(segments, rejected, input_stats)
@@ -1086,8 +1340,6 @@ def main():
             future_to_path = {}
             with concurrent.futures.ProcessPoolExecutor(
                 max_workers=max_workers,
-                initializer=_init_resume_audio_keys,
-                initargs=(processed_audio_keys,),
             ) as executor:
                 for json_path in json_files:
                     future = executor.submit(
@@ -1111,6 +1363,8 @@ def main():
                         segments, rejected, input_stats = future.result()
                     except Exception as e:
                         logger.exception(f"Error processing {json_path}: {e}")
+                        if dnsmos_enabled:
+                            raise
                         continue
                     persist_and_update(segments, rejected, input_stats)
 
@@ -1150,6 +1404,11 @@ def main():
                     "max_non_main_time": config.max_non_main_time,
                     "max_pause_for_merge": config.max_pause_for_merge,
                     "max_merged_duration": config.max_duration,
+                    "reject_clipped": config.reject_clipped,
+                    "clip_sample_threshold": config.clip_sample_threshold,
+                    "max_clip_ratio": config.max_clip_ratio,
+                    "min_dnsmos_sig": config.min_dnsmos_sig,
+                    "min_dnsmos_bak": config.min_dnsmos_bak,
                 },
             },
             f,
