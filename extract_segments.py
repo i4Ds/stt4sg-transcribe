@@ -308,28 +308,43 @@ def _get_dnsmos_scorer(config: FilterConfig) -> Optional[DNSMOSScorer]:
     return _DNSMOS_SCORER
 
 
-def load_segments_from_json(json_path: Path) -> tuple[str, List[Dict]]:
-    """Load segments with purity/coverage from batch_transcribe JSON output."""
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+def load_segments_from_json(json_path: Path) -> tuple[str, Optional[List[Dict]]]:
+    """Load segment payload from JSON; return (audio_file, None) when schema is not supported."""
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as exc:
+        logger.warning("Skipping unreadable JSON %s: %s", json_path, exc)
+        return "", None
 
-    audio_file = data.get("audio_file", "")
+    if not isinstance(data, dict):
+        logger.warning("Skipping non-object JSON payload: %s", json_path)
+        return "", None
 
-    # batch_transcribe.py outputs segments at root level with all metrics included
+    audio_file = str(data.get("audio_file") or "")
+
+    # batch_transcribe.py outputs segments at root level with all metrics included.
+    # If absent, this is likely metadata JSON (e.g. extraction_stats.json): skip it.
     segments = data.get("segments")
-    if not segments:
-        raise ValueError(
-            f"Missing segments in {json_path}. "
-            "Expected 'segments' array at root level."
+    if segments is None:
+        return audio_file, None
+    if not isinstance(segments, list):
+        logger.warning(
+            "Skipping JSON with non-list 'segments' field: %s",
+            json_path,
         )
+        return audio_file, None
+    if len(segments) == 0:
+        return audio_file, []
+    if not isinstance(segments[0], dict):
+        logger.warning("Skipping JSON with non-object segment entries: %s", json_path)
+        return audio_file, None
 
-    # Check that segments have purity/coverage (from diarization)
-    first_seg = segments[0] if segments else {}
+    # Guardrail: if diarization metrics are missing, this payload is not filter-ready.
+    first_seg = segments[0]
     if first_seg.get("purity") is None:
-        raise ValueError(
-            f"Segments missing purity in {json_path}. "
-            "Run with --diarization to populate purity/coverage for filtering."
-        )
+        logger.warning("Skipping segments without purity metric: %s", json_path)
+        return audio_file, None
 
     return audio_file, segments
 
@@ -752,6 +767,10 @@ def process_json_file(
     """
 
     audio_file, segments = load_segments_from_json(json_path)
+    if segments is None:
+        # Not a segment payload (e.g. extraction_stats.json): skip entirely.
+        return [], [], {"segments_in": 0, "duration_in": 0}
+
     logger.debug(f"Loaded {len(segments)} segments from {json_path}")
 
     # Track input stats for reporting
@@ -1302,7 +1321,6 @@ def main():
     rejected_sample_min_duration = float(config.min_duration)
     rejected_sample_count = 0
     rejected_sample_rng = random.Random()
-    rejected_audio_cache: Dict[str, AudioSegment] = {}
     manifest_mode = "w"
     logger.info(
         "Writing manifest incrementally to %s (%s mode)",
@@ -1367,18 +1385,17 @@ def main():
                 return None
             source_key = str(source_path.resolve())
 
-            audio = rejected_audio_cache.get(source_key)
-            if audio is None:
-                try:
-                    audio = AudioSegment.from_file(source_key)
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to load source audio for rejected sample %s: %s",
-                        source_key,
-                        exc,
-                    )
-                    return None
-                rejected_audio_cache[source_key] = audio
+            try:
+                # Do not cache full decoded source audios across files:
+                # keeping many long podcast waveforms in RAM can OOM the job.
+                audio = AudioSegment.from_file(source_key)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to load source audio for rejected sample %s: %s",
+                    source_key,
+                    exc,
+                )
+                return None
 
             stage = _safe_filename_token(stage or "rejected", max_len=24)
             source_stem = _safe_filename_token(source_path.stem, max_len=48)
@@ -1458,8 +1475,6 @@ def main():
                     )
                 except Exception as e:
                     logger.exception(f"Error processing {json_path}: {e}")
-                    if dnsmos_enabled:
-                        raise
                     continue
                 segments, rejected, input_stats = result
                 persist_and_update(segments, rejected, input_stats)
@@ -1490,8 +1505,6 @@ def main():
                         segments, rejected, input_stats = future.result()
                     except Exception as e:
                         logger.exception(f"Error processing {json_path}: {e}")
-                        if dnsmos_enabled:
-                            raise
                         continue
                     persist_and_update(segments, rejected, input_stats)
 
