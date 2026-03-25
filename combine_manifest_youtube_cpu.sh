@@ -1,10 +1,11 @@
 #!/bin/bash
 #SBATCH --time=48:00:00
-#SBATCH --cpus-per-task=8
-#SBATCH --job-name=yt_manifest_combine
+#SBATCH --cpus-per-task=16
+#SBATCH --job-name=yt_manifest_combine_cpu
 #SBATCH --mem=64G
 #SBATCH --partition=top6
 #SBATCH --nodes=1
+#SBATCH --gres=gpu:0
 #SBATCH --output=logs/yt_manifest_combine_%j.out
 #SBATCH --error=logs/yt_manifest_combine_%j.err
 
@@ -35,24 +36,21 @@ mkdir -p logs
 ROOT_DIR="/mnt/nas05/data02/vincenzo/podcast_data/youtube/processed"
 MANIFEST="${ROOT_DIR}/manifest.jsonl"
 EMOTION="${ROOT_DIR}/manifest.emotion.jsonl"
-OMNI="${ROOT_DIR}/manifest.omni.all.mixed50.ctx.zs.jsonl"
-DIALECT="${ROOT_DIR}/manifest_with_speaker_dialect.jsonl"
+DIALECT="${ROOT_DIR}/manifest_speaker_dialects.jsonl"
 TAGGED="${ROOT_DIR}/manifest.tagged.h200.v2.sliding.jsonl"
 OUT="${ROOT_DIR}/manifest_combined_sliding.jsonl"
 MISSING_CSV="${ROOT_DIR}/manifest_combined_missing_sliding.csv"
 
 [ -f "${MANIFEST}" ] || { echo "Missing file: ${MANIFEST}"; exit 1; }
 [ -f "${EMOTION}" ] || { echo "Missing file: ${EMOTION}"; exit 1; }
-[ -f "${OMNI}" ] || { echo "Missing file: ${OMNI}"; exit 1; }
 [ -f "${DIALECT}" ] || { echo "Missing file: ${DIALECT}"; exit 1; }
 [ -f "${TAGGED}" ] || { echo "Missing file: ${TAGGED}"; exit 1; }
 
-echo "== Combining manifest with emotion/omni/dialect/tag data =="
+echo "== Combining manifest with emotion/dialect/tag data =="
 
 python combine_manifests.py \
     "${MANIFEST}" \
     "${EMOTION}" \
-    "${OMNI}" \
     "${DIALECT}" \
     "${TAGGED}" \
     --output "${OUT}" \

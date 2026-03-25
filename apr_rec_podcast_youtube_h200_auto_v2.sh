@@ -2,7 +2,7 @@
 #SBATCH --time=48:00:00
 #SBATCH --cpus-per-task=32
 #SBATCH --job-name=apr_youtube_h200_v2
-#SBATCH --mem=64G
+#SBATCH --mem=96G
 #SBATCH --gres=gpu:h200:1
 #SBATCH --partition=h200
 #SBATCH --nodes=1

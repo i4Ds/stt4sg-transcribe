@@ -2,7 +2,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --job-name=yt_podcast_extract_segments
-#SBATCH --mem=32G
+#SBATCH --mem=64G
 #SBATCH --gres=gpu:0
 #SBATCH --partition=top6
 #SBATCH --nodes=1

@@ -2,7 +2,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --job-name ser_youtube
-#SBATCH --mem=64G
+#SBATCH --mem=96G
 #SBATCH --gres=gpu:1
 #SBATCH --partition=h200
 #SBATCH --nodes=1
