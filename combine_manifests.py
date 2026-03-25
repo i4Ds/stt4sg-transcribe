@@ -1,29 +1,23 @@
 #!/usr/bin/env python3
-"""Combine processed manifests into a training-oriented JSONL.
+"""Combine processed manifests into one raw merged JSONL.
 
-Output rows keep the base manifest metadata and add:
-- overall_emotion
-- overall_emotion_ratio
-- overall_emotion_score
-- dialect
-- dialect_code
-- dialect_source
-- tags
+This step performs no training-oriented filtering. It keeps the base manifest
+rows and attaches any matching annotation payloads that can be found:
 
-`tags` is a list of canonical non-speech events with:
-- from
-- to
-- tag
-- score
+- `emotion_frames`
+- `audio_tag_frames`
+- `dialect`
+- `dialect_code`
+- `dialect_name`
+- `dialect_source`
 
-Rows missing required annotations are skipped in `--skip-incomplete` mode or
-raise in strict mode.
+Downstream scripts can then derive filtered fields such as canonical `tags`,
+inline-tagged `text`, or sentence-level `emotion`.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import sys
 from pathlib import Path
@@ -92,17 +86,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=Path("manifest_combined.jsonl"),
         help="Output JSONL path (default: manifest_combined.jsonl).",
-    )
-    parser.add_argument(
-        "--skip-incomplete",
-        action="store_true",
-        help="Skip rows with missing required annotations instead of failing.",
-    )
-    parser.add_argument(
-        "--missing-report-csv",
-        type=Path,
-        default=Path("manifest_combined_missing.csv"),
-        help="CSV report path for skipped rows.",
     )
     args = parser.parse_args(argv)
 
@@ -547,14 +530,10 @@ def main(argv: list[str] | None = None) -> int:
     dialect_by_audio_alias = _build_audio_index(dialect_by_audio)
 
     output_path = resolve_output_path(args.manifest, args.output)
-    report_path = resolve_report_path(args.manifest, args.missing_report_csv)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.parent.mkdir(parents=True, exist_ok=True)
 
     rows = 0
     written_rows = 0
-    skipped_rows = 0
-    skipped_report: list[dict[str, str]] = []
 
     with args.manifest.open("r", encoding="utf-8") as infile, output_path.open(
         "w", encoding="utf-8"
@@ -574,45 +553,24 @@ def main(argv: list[str] | None = None) -> int:
 
             rows += 1
             merged = dict(row)
-            missing: list[str] = []
 
             audio_path = merged.get("audio_path")
-            text = merged.get("text")
-            if not isinstance(audio_path, str) or not audio_path:
-                missing.append("audio_path")
-            if not isinstance(text, str) or not text.strip():
-                missing.append("text")
 
             emotion_frames = None
             if isinstance(audio_path, str):
                 emotion_frames = emotion_by_audio.get(audio_path) or _lookup_audio(
                     emotion_by_audio_alias, audio_path
                 )
-            if not isinstance(emotion_frames, list) or not emotion_frames:
-                missing.append("emotion_frames")
-            else:
+            if isinstance(emotion_frames, list) and emotion_frames:
                 merged["emotion_frames"] = emotion_frames
-                overall = derive_overall_emotion(emotion_frames)
-                if overall is None:
-                    missing.append("overall_emotion")
-                else:
-                    label, ratio, score = overall
-                    merged["overall_emotion"] = label
-                    merged["overall_emotion_ratio"] = round(ratio, 4)
-                    if score is not None:
-                        merged["overall_emotion_score"] = round(score, 4)
 
             tag_frames = None
             if isinstance(audio_path, str):
                 tag_frames = tags_by_audio.get(audio_path) or _lookup_audio(
                     tags_by_audio_alias, audio_path
                 )
-            if not isinstance(tag_frames, list) or not tag_frames:
-                missing.append("audio_tag_frames")
-            else:
+            if isinstance(tag_frames, list) and tag_frames:
                 merged["audio_tag_frames"] = tag_frames
-                tag_events = derive_tag_events(tag_frames)
-                merged["tags"] = tag_events
 
             dialect_payload = resolve_dialect_payload(
                 merged,
@@ -620,15 +578,9 @@ def main(argv: list[str] | None = None) -> int:
                 by_audio_alias=dialect_by_audio_alias,
                 by_source_speaker=dialect_by_source_speaker,
             )
-            if dialect_payload is None:
-                missing.append("dialect")
-            else:
+            if dialect_payload is not None:
                 dialect_code = dialect_payload.get("dialect_code")
                 dialect_name = dialect_payload.get("dialect_name")
-                if not _is_present(dialect_code):
-                    missing.append("dialect_code")
-                if not _is_present(dialect_name):
-                    missing.append("dialect_name")
                 if _is_present(dialect_code):
                     merged["dialect_code"] = dialect_code
                 if _is_present(dialect_name):
@@ -638,45 +590,8 @@ def main(argv: list[str] | None = None) -> int:
                 if _is_present(source):
                     merged["dialect_source"] = source
 
-            if missing:
-                if not args.skip_incomplete:
-                    raise KeyError(
-                        f"Missing data for audio_path='{audio_path}' at manifest line "
-                        f"{line_num}: {', '.join(missing)}"
-                    )
-                skipped_rows += 1
-                skipped_report.append(
-                    _missing_csv_row(
-                        line_num=line_num,
-                        audio_path=str(audio_path or ""),
-                        source_audio=str(merged.get("source_audio", "")),
-                        speaker=str(merged.get("speaker", "")),
-                        missing=missing,
-                    )
-                )
-                continue
-
             out.write(json.dumps(merged, ensure_ascii=False) + "\n")
             written_rows += 1
-
-    if args.skip_incomplete:
-        with report_path.open("w", encoding="utf-8", newline="") as rep:
-            writer = csv.DictWriter(
-                rep,
-                fieldnames=[
-                    "manifest_line",
-                    "audio_path",
-                    "source_audio",
-                    "speaker",
-                    "missing_count",
-                    "missing_fields",
-                ],
-            )
-            writer.writeheader()
-            for record in skipped_report:
-                writer.writerow(record)
-        print(f"Missing report CSV: {report_path}")
-        print(f"Rows skipped (incomplete): {skipped_rows}")
 
     print(f"Wrote: {output_path}")
     print(f"Rows processed: {rows}")

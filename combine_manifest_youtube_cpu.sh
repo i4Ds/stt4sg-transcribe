@@ -38,24 +38,31 @@ MANIFEST="${ROOT_DIR}/manifest.jsonl"
 EMOTION="${ROOT_DIR}/manifest.emotion.jsonl"
 DIALECT="${ROOT_DIR}/manifest_speaker_dialects.jsonl"
 TAGGED="${ROOT_DIR}/manifest.tagged.h200.v2.sliding.jsonl"
-OUT="${ROOT_DIR}/manifest_combined_sliding.jsonl"
-MISSING_CSV="${ROOT_DIR}/manifest_combined_missing_sliding.csv"
+COMBINED_OUT="${ROOT_DIR}/manifest_combined_sliding.jsonl"
+FINAL_OUT="${ROOT_DIR}/manifest_final_sliding.jsonl"
+FINAL_MISSING_CSV="${ROOT_DIR}/manifest_final_missing_sliding.csv"
 
 [ -f "${MANIFEST}" ] || { echo "Missing file: ${MANIFEST}"; exit 1; }
 [ -f "${EMOTION}" ] || { echo "Missing file: ${EMOTION}"; exit 1; }
 [ -f "${DIALECT}" ] || { echo "Missing file: ${DIALECT}"; exit 1; }
 [ -f "${TAGGED}" ] || { echo "Missing file: ${TAGGED}"; exit 1; }
 
-echo "== Combining manifest with emotion/dialect/tag data =="
+echo "== Step 1/2: combining manifest with raw emotion/dialect/tag payloads =="
 
 python combine_manifests.py \
     "${MANIFEST}" \
     "${EMOTION}" \
     "${DIALECT}" \
     "${TAGGED}" \
-    --output "${OUT}" \
-    --skip-incomplete \
-    --missing-report-csv "${MISSING_CSV}"
+    --output "${COMBINED_OUT}"
 
-echo "Done. Output: ${OUT}"
-echo "Missing report: ${MISSING_CSV}"
+echo "== Step 2/2: creating final training manifest =="
+
+python create_final_manifest.py \
+    "${COMBINED_OUT}" \
+    --output "${FINAL_OUT}" \
+    --missing-report-csv "${FINAL_MISSING_CSV}"
+
+echo "Combined output: ${COMBINED_OUT}"
+echo "Final output: ${FINAL_OUT}"
+echo "Missing report: ${FINAL_MISSING_CSV}"

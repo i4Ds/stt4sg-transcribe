@@ -12,3 +12,5 @@ PIPELINE.md
 swissdial_hu/*
 swissdial_all.tar.gz
 stt4sg-350/*
+build_hf_srg_dataset.py
+build_hf_stt4sg_350_dataset.py
