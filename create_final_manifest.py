@@ -9,6 +9,9 @@ This step:
   - audio_path
   - text
   - emotion
+  - tags
+  - dnsmos_sig
+  - dnsmos_bak
 """
 
 from __future__ import annotations
@@ -57,6 +60,15 @@ def _as_float(value: Any) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
     return None
+
+
+def _extract_dnsmos(row: dict[str, Any]) -> tuple[float | None, float | None]:
+    source_metrics = row.get("source_metrics")
+    if not isinstance(source_metrics, dict):
+        return None, None
+    sig = _as_float(source_metrics.get("dnsmos_sig"))
+    bak = _as_float(source_metrics.get("dnsmos_bak"))
+    return sig, bak
 
 
 def _normalized_word_tokens(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -214,11 +226,17 @@ def main(argv: list[str] | None = None) -> int:
 
             emotion_label, _, _ = overall
             final_text = inject_tags_into_text(text, row.get("words"), tags)
+            dnsmos_sig, dnsmos_bak = _extract_dnsmos(row)
             payload = {
                 "audio_path": audio_path,
                 "text": final_text,
                 "emotion": emotion_label.upper(),
+                "tags": tags,
             }
+            if dnsmos_sig is not None:
+                payload["dnsmos_sig"] = round(dnsmos_sig, 4)
+            if dnsmos_bak is not None:
+                payload["dnsmos_bak"] = round(dnsmos_bak, 4)
             out.write(json.dumps(payload, ensure_ascii=False) + "\n")
             written += 1
 
