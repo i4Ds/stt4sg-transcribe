@@ -9,6 +9,7 @@ This step:
   - audio_path
   - text
   - emotion
+  - dialect
   - tags
   - dnsmos_sig
   - dnsmos_bak
@@ -69,6 +70,16 @@ def _extract_dnsmos(row: dict[str, Any]) -> tuple[float | None, float | None]:
     sig = _as_float(source_metrics.get("dnsmos_sig"))
     bak = _as_float(source_metrics.get("dnsmos_bak"))
     return sig, bak
+
+
+def _extract_dialect(row: dict[str, Any]) -> str | None:
+    for key in ("dialect", "dialect_name"):
+        value = row.get(key)
+        if isinstance(value, str):
+            value = value.strip()
+            if value:
+                return value
+    return None
 
 
 def _normalized_word_tokens(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -226,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
 
             emotion_label, _, _ = overall
             final_text = inject_tags_into_text(text, row.get("words"), tags)
+            dialect = _extract_dialect(row)
             dnsmos_sig, dnsmos_bak = _extract_dnsmos(row)
             payload = {
                 "audio_path": audio_path,
@@ -233,6 +245,8 @@ def main(argv: list[str] | None = None) -> int:
                 "emotion": emotion_label.upper(),
                 "tags": tags,
             }
+            if dialect is not None:
+                payload["dialect"] = dialect
             if dnsmos_sig is not None:
                 payload["dnsmos_sig"] = round(dnsmos_sig, 4)
             if dnsmos_bak is not None:
