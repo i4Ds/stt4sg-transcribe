@@ -7,9 +7,10 @@ This step:
 - injects tags into `text` using word timings when available
 - emits a compact output schema:
   - audio_path
+  - base_audio_path
   - text
   - emotion
-  - dialect
+  - dialect_tag
   - tags
   - dnsmos_sig
   - dnsmos_bak
@@ -72,13 +73,22 @@ def _extract_dnsmos(row: dict[str, Any]) -> tuple[float | None, float | None]:
     return sig, bak
 
 
-def _extract_dialect(row: dict[str, Any]) -> str | None:
-    for key in ("dialect", "dialect_name"):
+def _extract_dialect_tag(row: dict[str, Any]) -> str | None:
+    for key in ("dialect_tag", "dialect", "dialect_name"):
         value = row.get(key)
         if isinstance(value, str):
             value = value.strip()
             if value:
                 return value
+    return None
+
+
+def _extract_base_audio_path(row: dict[str, Any]) -> str | None:
+    value = row.get("source_audio")
+    if isinstance(value, str):
+        value = value.strip()
+        if value:
+            return value
     return None
 
 
@@ -237,7 +247,8 @@ def main(argv: list[str] | None = None) -> int:
 
             emotion_label, _, _ = overall
             final_text = inject_tags_into_text(text, row.get("words"), tags)
-            dialect = _extract_dialect(row)
+            dialect_tag = _extract_dialect_tag(row)
+            base_audio_path = _extract_base_audio_path(row)
             dnsmos_sig, dnsmos_bak = _extract_dnsmos(row)
             payload = {
                 "audio_path": audio_path,
@@ -245,8 +256,10 @@ def main(argv: list[str] | None = None) -> int:
                 "emotion": emotion_label.upper(),
                 "tags": tags,
             }
-            if dialect is not None:
-                payload["dialect"] = dialect
+            if base_audio_path is not None:
+                payload["base_audio_path"] = base_audio_path
+            if dialect_tag is not None:
+                payload["dialect_tag"] = dialect_tag
             if dnsmos_sig is not None:
                 payload["dnsmos_sig"] = round(dnsmos_sig, 4)
             if dnsmos_bak is not None:

@@ -13,12 +13,34 @@ from typing import Any
 
 import gradio as gr
 
-DEFAULT_MANIFEST = "/mnt/nas05/data02/vincenzo/podcast_data/youtube/processed/manifest_combined_sample.jsonl"
-TAG_DISPLAY_MIN_START_SECONDS = 2.0
+from combine_manifests import (
+    CANONICAL_TAG_ORDER as COMBINE_CANONICAL_TAG_ORDER,
+    DEFAULT_TAG_MIN_DURATION_S as COMBINE_DEFAULT_TAG_MIN_DURATION_S,
+    GROUP_MIN_DURATION_S as COMBINE_GROUP_MIN_DURATION_S,
+    GROUP_MIN_PROB as COMBINE_GROUP_MIN_PROB,
+    TAG_DISPLAY_MIN_START_SECONDS as COMBINE_TAG_DISPLAY_MIN_START_SECONDS,
+    TAG_GROUP_BREATHING as COMBINE_TAG_GROUP_BREATHING,
+    TAG_GROUP_CHUCKLE as COMBINE_TAG_GROUP_CHUCKLE,
+    TAG_GROUP_LAUGHTER as COMBINE_TAG_GROUP_LAUGHTER,
+    TAG_GROUP_SIGH as COMBINE_TAG_GROUP_SIGH,
+    _normalize_tag_label as combine_normalize_tag_label,
+    _tag_group_from_raw_label as combine_tag_group_from_raw_label,
+)
+from create_final_manifest import inject_tags_into_text
+
+DEFAULT_MANIFEST = "/mnt/nas05/data02/vincenzo/podcast_data/youtube/processed/manifest_combined_sliding_sample.jsonl"
+TAG_DISPLAY_MIN_START_SECONDS = COMBINE_TAG_DISPLAY_MIN_START_SECONDS
 
 RAW_JSON_KEYS = [
     "audio_path",
+    "base_audio_path",
     "text",
+    "tags",
+    "dialect_tag",
+    "dialect",
+    "dialect_name",
+    "dialect_code",
+    "dialect_source",
     "start",
     "end",
     "duration",
@@ -31,6 +53,9 @@ RAW_JSON_KEYS = [
     "avg_word_score",
     "is_merged",
     "merge_count",
+    "words",
+    "emotion_frames",
+    "audio_tag_frames",
     "source_metrics",
     "source_audio",
     "source_json",
@@ -155,29 +180,10 @@ def _load_topk_label_vocab() -> list[str]:
 
 TOPK_LABEL_VOCAB = _load_topk_label_vocab()
 
-CANONICAL_TAG_ORDER = [
-    "<speech>",
-    "<laugh>",
-    "<chuckle>",
-    "<sigh>",
-    "<cough>",
-    "<sniffle>",
-    "<groan>",
-    "<yawn>",
-    "<gasp>",
-]
-
-DEFAULT_TAG_MIN_DURATION_S = {
-    "<speech>": 0.15,
-    "<laugh>": 0.30,
-    "<chuckle>": 0.25,
-    "<sigh>": 0.12,
-    "<cough>": 0.08,
-    "<sniffle>": 0.08,
-    "<groan>": 0.15,
-    "<yawn>": 0.20,
-    "<gasp>": 0.10,
-}
+CANONICAL_TAG_ORDER = list(COMBINE_CANONICAL_TAG_ORDER)
+DEFAULT_TAG_MIN_DURATION_S = dict(COMBINE_DEFAULT_TAG_MIN_DURATION_S)
+DEFAULT_GROUP_MIN_PROB = dict(COMBINE_GROUP_MIN_PROB)
+DEFAULT_GROUP_MIN_DURATION_S = dict(COMBINE_GROUP_MIN_DURATION_S)
 
 AGG_TAG_SLIDERS: list[tuple[str, str]] = [
     ("<speech>", "Speech"),
@@ -203,57 +209,14 @@ DISPLAY_TAG_LABEL = {
     "<gasp>": "Gasp/Breathing",
 }
 
-TAG_GROUP_LAUGHTER = "Laughter"
-TAG_GROUP_CHUCKLE = "Chuckle/Giggle"
-TAG_GROUP_BREATHING = "Breathing"
-TAG_GROUP_SIGH = "Sigh"
+TAG_GROUP_LAUGHTER = COMBINE_TAG_GROUP_LAUGHTER
+TAG_GROUP_CHUCKLE = COMBINE_TAG_GROUP_CHUCKLE
+TAG_GROUP_BREATHING = COMBINE_TAG_GROUP_BREATHING
+TAG_GROUP_SIGH = COMBINE_TAG_GROUP_SIGH
 
 
 def _tag_group_from_raw_label(label: str) -> str | None:
-    canonical = _normalize_tag_label(label)
-    if canonical == "<speech>":
-        return None
-    if canonical == "<laugh>":
-        return TAG_GROUP_LAUGHTER
-    if canonical == "<chuckle>":
-        return TAG_GROUP_CHUCKLE
-    if canonical == "<sigh>":
-        return TAG_GROUP_SIGH
-    if canonical in {"<cough>", "<sniffle>", "<groan>", "<yawn>", "<gasp>"}:
-        return TAG_GROUP_BREATHING
-
-    raw = label.strip().lower()
-    if not raw:
-        return None
-
-    if raw in {
-        "laughter",
-        "baby laughter",
-        "belly laugh",
-    }:
-        return TAG_GROUP_LAUGHTER
-
-    if raw in {
-        "snicker",
-        "chuckle, chortle",
-        "giggle",
-    }:
-        return TAG_GROUP_CHUCKLE
-
-    if raw in {"sigh"}:
-        return TAG_GROUP_SIGH
-
-    if raw in {
-        "gasp",
-        "pant",
-        "snort",
-        "wheeze",
-        "breathing",
-        "snoring",
-    }:
-        return TAG_GROUP_BREATHING
-
-    return None
+    return combine_tag_group_from_raw_label(label)
 
 
 def _pretty_tag_label(label: str) -> str:
@@ -264,36 +227,7 @@ def _pretty_tag_label(label: str) -> str:
 
 
 def _normalize_tag_label(label: str) -> str | None:
-    raw = label.strip().lower()
-    if not raw:
-        return None
-    if raw in CANONICAL_TAG_ORDER:
-        return raw
-
-    if raw in SPEECH_TAGS:
-        return "<speech>"
-
-    if raw in {"laughter"}:
-        return "<laugh>"
-    if raw in {"snicker", "chuckle, chortle", "giggle"}:
-        return "<laugh>"
-    if raw in {"sigh"}:
-        return "<sigh>"
-    if raw in {"cough", "throat clearing"}:
-        return "<cough>"
-    if raw in {"sniff", "sneeze"}:
-        return "<sniffle>"
-    if raw in {"groan", "grunt", "wail, moan", "crying, sobbing"}:
-        return "<groan>"
-    if raw in {"gasp", "pant", "snort", "wheeze", "breathing", "snoring"}:
-        return "<gasp>"
-
-    # Keep these vocal events under speech bucket in browser view.
-    if raw in {"shout", "screaming", "whispering", "singing", "humming"}:
-        return "<speech>"
-
-    # yawn is part of target UI vocabulary, but no current source label maps to it.
-    return None
+    return combine_normalize_tag_label(label)
 
 
 def _canonical_rank(tag: str) -> int:
@@ -1041,11 +975,6 @@ def _merge_group_events(
 
 def _group_tag_events(
     record: dict[str, Any],
-    *,
-    sigh_min_prob: float = 0.0,
-    laughter_min_prob: float = 0.0,
-    chuckle_min_prob: float = 0.0,
-    breathing_min_prob: float = 0.0,
 ) -> dict[str, list[dict[str, Any]]]:
     out: dict[str, list[dict[str, Any]]] = {
         TAG_GROUP_SIGH: [],
@@ -1054,37 +983,44 @@ def _group_tag_events(
         TAG_GROUP_BREATHING: [],
     }
 
-    sigh_min_prob = max(0.0, min(1.0, float(sigh_min_prob)))
-    laughter_min_prob = max(0.0, min(1.0, float(laughter_min_prob)))
-    chuckle_min_prob = max(0.0, min(1.0, float(chuckle_min_prob)))
-    breathing_min_prob = max(0.0, min(1.0, float(breathing_min_prob)))
+    frames = record.get("audio_tag_frames")
+    if not isinstance(frames, list):
+        return out
+    for frame in frames:
+        if not isinstance(frame, dict):
+            continue
+        start = _as_float(frame.get("start"))
+        end = _as_float(frame.get("end"))
+        tags = frame.get("audio_tags")
+        if start is None or end is None or not isinstance(tags, dict):
+            continue
+        if end < start:
+            start, end = end, start
 
-    def _group_threshold(group: str) -> float:
-        if group == TAG_GROUP_LAUGHTER:
-            return laughter_min_prob
-        if group == TAG_GROUP_CHUCKLE:
-            return chuckle_min_prob
-        if group == TAG_GROUP_SIGH:
-            return sigh_min_prob
-        return breathing_min_prob
-
-    def _append_group_rows(
-        *,
-        start: float,
-        end: float,
-        group_scores: dict[str, float],
-        group_label_scores: dict[str, dict[str, list[float]]],
-    ) -> None:
-        for group, window_max_prob in group_scores.items():
-            mean_prob = float(window_max_prob)
-            if mean_prob < _group_threshold(group):
+        group_scores: dict[str, float] = {}
+        group_raw_scores: dict[str, dict[str, float]] = {}
+        for raw_label, raw_prob in tags.items():
+            if not isinstance(raw_label, str):
                 continue
-            raw_scores = group_label_scores.get(group, {})
+            prob = _as_float(raw_prob)
+            if prob is None:
+                continue
+            group = _tag_group_from_raw_label(raw_label)
+            if group is None:
+                continue
+            old = group_scores.get(group)
+            group_scores[group] = prob if old is None else max(old, prob)
+            current = group_raw_scores.setdefault(group, {})
+            prev_prob = _as_float(current.get(raw_label))
+            current[raw_label] = prob if prev_prob is None else max(prev_prob, prob)
+
+        for group, score in group_scores.items():
+            raw_scores = group_raw_scores.get(group, {})
             raw_top3 = sorted(
                 (
-                    (lbl, sum(vals) / float(len(vals)))
-                    for lbl, vals in raw_scores.items()
-                    if vals
+                    (label, float(prob))
+                    for label, prob in raw_scores.items()
+                    if isinstance(label, str) and _as_float(prob) is not None
                 ),
                 key=lambda x: (-x[1], x[0]),
             )[:3]
@@ -1095,104 +1031,229 @@ def _group_tag_events(
                     "end": round(end, 3),
                     "label": group,
                     "raw_label": raw_label,
-                    "score": round(float(mean_prob), 4),
-                    "raw_top3": [
-                        (lbl, round(float(prob), 4)) for lbl, prob in raw_top3
-                    ],
+                    "score": round(float(score), 4),
+                    "raw_scores": raw_scores,
+                    "raw_top3": [(label, round(prob, 4)) for label, prob in raw_top3],
+                }
+            )
+    return out
+
+
+def _cluster_group_rows(
+    rows: list[dict[str, Any]], *, merge_gap: float = 0.05
+) -> list[dict[str, Any]]:
+    cleaned: list[dict[str, Any]] = []
+    for row in rows:
+        start = _as_float(row.get("start"))
+        end = _as_float(row.get("end"))
+        score = _as_float(row.get("score"))
+        raw_scores = row.get("raw_scores")
+        if start is None or end is None or score is None or not isinstance(raw_scores, dict):
+            continue
+        if end < start:
+            start, end = end, start
+        cleaned.append(
+            {
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "score": round(score, 4),
+                "raw_scores": dict(raw_scores),
+                "row": row,
+            }
+        )
+
+    if not cleaned:
+        return []
+
+    cleaned.sort(key=lambda x: (x["start"], x["end"]))
+    clusters: list[dict[str, Any]] = []
+    for row in cleaned:
+        if not clusters or row["start"] > clusters[-1]["end"] + merge_gap:
+            clusters.append(
+                {
+                    "start": row["start"],
+                    "end": row["end"],
+                    "score": row["score"],
+                    "raw_scores": dict(row["raw_scores"]),
+                    "peak_row": row["row"],
+                }
+            )
+            continue
+
+        cluster = clusters[-1]
+        cluster["end"] = max(cluster["end"], row["end"])
+        cluster["score"] = max(float(cluster["score"]), row["score"])
+        cluster_raw_scores = cluster["raw_scores"]
+        for label, prob in row["raw_scores"].items():
+            old = _as_float(cluster_raw_scores.get(label))
+            cluster_raw_scores[label] = prob if old is None else max(old, prob)
+        peak_score = _as_float(cluster["peak_row"].get("score"))
+        if peak_score is None or row["score"] >= peak_score:
+            cluster["peak_row"] = row["row"]
+    return clusters
+
+
+def _display_group_events(
+    rows: list[dict[str, Any]],
+    *,
+    group: str,
+    min_prob: float,
+    min_duration_s: float,
+    min_start_seconds: float,
+) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        start = _as_float(row.get("start"))
+        score = _as_float(row.get("score"))
+        if start is None or score is None:
+            continue
+        if start < min_start_seconds:
+            continue
+        if score < min_prob:
+            continue
+        filtered.append(row)
+
+    clusters = _cluster_group_rows(filtered)
+    out: list[dict[str, Any]] = []
+    for cluster in clusters:
+        cluster_start = _as_float(cluster.get("start"))
+        cluster_end = _as_float(cluster.get("end"))
+        peak_row = cluster.get("peak_row")
+        if cluster_start is None or cluster_end is None or not isinstance(peak_row, dict):
+            continue
+        if (cluster_end - cluster_start) < min_duration_s:
+            continue
+
+        if group in {TAG_GROUP_LAUGHTER, TAG_GROUP_CHUCKLE}:
+            event_start = cluster_start
+            event_end = cluster_end
+            event_score = _as_float(cluster.get("score"))
+            raw_scores = cluster.get("raw_scores")
+        else:
+            event_start = _as_float(peak_row.get("start"))
+            event_end = _as_float(peak_row.get("end"))
+            event_score = _as_float(peak_row.get("score"))
+            raw_scores = peak_row.get("raw_scores")
+
+        if (
+            event_start is None
+            or event_end is None
+            or event_score is None
+            or not isinstance(raw_scores, dict)
+        ):
+            continue
+
+        raw_top3 = sorted(
+            (
+                (label, float(prob))
+                for label, prob in raw_scores.items()
+                if isinstance(label, str) and _as_float(prob) is not None
+            ),
+            key=lambda x: (-x[1], x[0]),
+        )[:3]
+        raw_label = raw_top3[0][0] if raw_top3 else group
+        out.append(
+            {
+                "start": round(event_start, 3),
+                "end": round(event_end, 3),
+                "label": group,
+                "raw_label": raw_label,
+                "score": round(event_score, 4),
+                "raw_scores": raw_scores,
+                "raw_top3": [(label, round(prob, 4)) for label, prob in raw_top3],
+            }
+        )
+    return out
+
+
+def _merge_canonical_tag_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not events:
+        return []
+    events = sorted(events, key=lambda x: (x["from"], x["to"], x["tag"]))
+    merged = [dict(events[0])]
+    for event in events[1:]:
+        prev = merged[-1]
+        if event["tag"] == prev["tag"] and event["from"] <= prev["to"] + 0.05:
+            prev["to"] = max(prev["to"], event["to"])
+            prev["score"] = round(max(prev["score"], event["score"]), 4)
+        else:
+            merged.append(dict(event))
+    return merged
+
+
+def _derive_canonical_tag_events(
+    record: dict[str, Any],
+    *,
+    min_start_seconds: float,
+    sigh_min_prob: float,
+    sigh_min_duration_s: float,
+    laughter_min_prob: float,
+    laughter_min_duration_s: float,
+    chuckle_min_prob: float,
+    chuckle_min_duration_s: float,
+    breathing_min_prob: float,
+    breathing_min_duration_s: float,
+) -> list[dict[str, Any]]:
+    grouped = _group_tag_events(record)
+    events: list[dict[str, Any]] = []
+    thresholds = {
+        TAG_GROUP_SIGH: (float(sigh_min_prob), float(sigh_min_duration_s)),
+        TAG_GROUP_LAUGHTER: (float(laughter_min_prob), float(laughter_min_duration_s)),
+        TAG_GROUP_CHUCKLE: (float(chuckle_min_prob), float(chuckle_min_duration_s)),
+        TAG_GROUP_BREATHING: (
+            float(breathing_min_prob),
+            float(breathing_min_duration_s),
+        ),
+    }
+
+    for group, rows in grouped.items():
+        min_prob, min_duration_s = thresholds[group]
+        filtered = _display_group_events(
+            rows,
+            group=group,
+            min_prob=min_prob,
+            min_duration_s=min_duration_s,
+            min_start_seconds=min_start_seconds,
+        )
+        for row in filtered:
+            start = _as_float(row.get("start"))
+            end = _as_float(row.get("end"))
+            score = _as_float(row.get("score"))
+            raw_top3 = row.get("raw_top3")
+            if (
+                start is None
+                or end is None
+                or score is None
+                or not isinstance(raw_top3, list)
+            ):
+                continue
+            if group in {TAG_GROUP_LAUGHTER, TAG_GROUP_CHUCKLE}:
+                canonical = "<laugh>"
+            elif group == TAG_GROUP_SIGH:
+                canonical = "<sigh>"
+            else:
+                if not raw_top3:
+                    continue
+                first_label = raw_top3[0][0]
+                if not isinstance(first_label, str):
+                    continue
+                canonical = _normalize_tag_label(first_label)
+
+            if canonical is None or canonical == "<speech>":
+                continue
+            canonical_min_duration_s = DEFAULT_TAG_MIN_DURATION_S.get(canonical, 0.0)
+            if (end - start) < canonical_min_duration_s:
+                continue
+            events.append(
+                {
+                    "from": round(start, 3),
+                    "to": round(end, 3),
+                    "tag": canonical,
+                    "score": round(score, 4),
                 }
             )
 
-    topk = record.get("audio_tag_topk")
-    if isinstance(topk, dict):
-        idx_rows = topk.get("top_idx")
-        prob_rows = topk.get("top_prob")
-        if isinstance(idx_rows, list) and isinstance(prob_rows, list):
-            row_count = min(len(idx_rows), len(prob_rows))
-            duration = _as_float(record.get("duration"))
-            if duration is None or duration <= 0:
-                seg_start = _as_float(record.get("start"))
-                seg_end = _as_float(record.get("end"))
-                if (
-                    seg_start is not None
-                    and seg_end is not None
-                    and seg_end > seg_start
-                ):
-                    duration = seg_end - seg_start
-            if duration is None or duration <= 0:
-                duration = float(max(row_count, 1)) * 0.02
-            step = duration / float(max(row_count, 1))
-
-            for i in range(row_count):
-                idx_row = idx_rows[i]
-                prob_row = prob_rows[i]
-                if not isinstance(idx_row, list) or not isinstance(prob_row, list):
-                    continue
-                group_scores: dict[str, float] = {}
-                group_label_scores: dict[str, dict[str, list[float]]] = {}
-                for raw_idx, raw_prob in zip(idx_row, prob_row):
-                    if not isinstance(raw_idx, int):
-                        continue
-                    if raw_idx < 0 or raw_idx >= len(TOPK_LABEL_VOCAB):
-                        continue
-                    prob = _as_float(raw_prob)
-                    if prob is None:
-                        continue
-                    raw_label = TOPK_LABEL_VOCAB[raw_idx]
-                    group = _tag_group_from_raw_label(raw_label)
-                    if group is None:
-                        continue
-                    prev = group_scores.get(group)
-                    group_scores[group] = prob if prev is None else max(prev, prob)
-                    group_label_scores.setdefault(group, {}).setdefault(
-                        raw_label, []
-                    ).append(prob)
-                _append_group_rows(
-                    start=float(i) * step,
-                    end=float(i + 1) * step,
-                    group_scores=group_scores,
-                    group_label_scores=group_label_scores,
-                )
-
-    frames = record.get("audio_tag_frames")
-    if isinstance(frames, list):
-        for frame in frames:
-            if not isinstance(frame, dict):
-                continue
-            start = _as_float(frame.get("start"))
-            end = _as_float(frame.get("end"))
-            tags = frame.get("audio_tags")
-            if start is None or end is None or not isinstance(tags, dict):
-                continue
-            if end < start:
-                start, end = end, start
-            group_scores: dict[str, float] = {}
-            group_label_scores: dict[str, dict[str, list[float]]] = {}
-            for raw_label, raw_prob in tags.items():
-                if not isinstance(raw_label, str):
-                    continue
-                prob = _as_float(raw_prob)
-                if prob is None:
-                    continue
-                group = _tag_group_from_raw_label(raw_label)
-                if group is None:
-                    continue
-                prev = group_scores.get(group)
-                group_scores[group] = prob if prev is None else max(prev, prob)
-                group_label_scores.setdefault(group, {}).setdefault(
-                    raw_label, []
-                ).append(prob)
-            _append_group_rows(
-                start=start,
-                end=end,
-                group_scores=group_scores,
-                group_label_scores=group_label_scores,
-            )
-
-    out[TAG_GROUP_SIGH] = _merge_group_events(out[TAG_GROUP_SIGH])
-    out[TAG_GROUP_LAUGHTER] = _merge_group_events(out[TAG_GROUP_LAUGHTER])
-    out[TAG_GROUP_CHUCKLE] = _merge_group_events(out[TAG_GROUP_CHUCKLE])
-    out[TAG_GROUP_BREATHING] = _merge_group_events(out[TAG_GROUP_BREATHING])
-    return out
+    return _merge_canonical_tag_events(events)
 
 
 def _filter_group_events(
@@ -1491,40 +1552,57 @@ def _merge_adjacent_tag_rows(
 
 def _fmt_timeline_html(
     record: dict[str, Any],
+    min_start_seconds: float = TAG_DISPLAY_MIN_START_SECONDS,
     sigh_min_prob: float = 0.0,
+    sigh_min_duration_s: float = 0.0,
     laughter_min_prob: float = 0.0,
     laughter_min_duration_s: float = 0.0,
     chuckle_min_prob: float = 0.0,
+    chuckle_min_duration_s: float = 0.0,
     breathing_min_prob: float = 0.0,
+    breathing_min_duration_s: float = 0.0,
 ) -> str:
     emotion_timeline = _emotion_timeline(record)
-    grouped_tag_events = _group_tag_events(
+    grouped_tag_events = _group_tag_events(record)
+    derived_tags = _derive_canonical_tag_events(
         record,
+        min_start_seconds=min_start_seconds,
         sigh_min_prob=sigh_min_prob,
+        sigh_min_duration_s=sigh_min_duration_s,
         laughter_min_prob=laughter_min_prob,
+        laughter_min_duration_s=laughter_min_duration_s,
         chuckle_min_prob=chuckle_min_prob,
+        chuckle_min_duration_s=chuckle_min_duration_s,
         breathing_min_prob=breathing_min_prob,
+        breathing_min_duration_s=breathing_min_duration_s,
     )
-    laughter_rows = _filter_group_events(
+    laughter_rows = _display_group_events(
         grouped_tag_events.get(TAG_GROUP_LAUGHTER, []),
+        group=TAG_GROUP_LAUGHTER,
         min_prob=laughter_min_prob,
         min_duration_s=laughter_min_duration_s,
-        min_start_seconds=TAG_DISPLAY_MIN_START_SECONDS,
+        min_start_seconds=min_start_seconds,
     )
-    sigh_rows = _filter_group_events(
+    sigh_rows = _display_group_events(
         grouped_tag_events.get(TAG_GROUP_SIGH, []),
+        group=TAG_GROUP_SIGH,
         min_prob=sigh_min_prob,
-        min_start_seconds=TAG_DISPLAY_MIN_START_SECONDS,
+        min_duration_s=sigh_min_duration_s,
+        min_start_seconds=min_start_seconds,
     )
-    chuckle_rows = _filter_group_events(
+    chuckle_rows = _display_group_events(
         grouped_tag_events.get(TAG_GROUP_CHUCKLE, []),
+        group=TAG_GROUP_CHUCKLE,
         min_prob=chuckle_min_prob,
-        min_start_seconds=TAG_DISPLAY_MIN_START_SECONDS,
+        min_duration_s=chuckle_min_duration_s,
+        min_start_seconds=min_start_seconds,
     )
-    breathing_rows = _filter_group_events(
+    breathing_rows = _display_group_events(
         grouped_tag_events.get(TAG_GROUP_BREATHING, []),
+        group=TAG_GROUP_BREATHING,
         min_prob=breathing_min_prob,
-        min_start_seconds=TAG_DISPLAY_MIN_START_SECONDS,
+        min_duration_s=breathing_min_duration_s,
+        min_start_seconds=min_start_seconds,
     )
     total = _segment_duration(
         record,
@@ -1550,6 +1628,36 @@ def _fmt_timeline_html(
             )
     else:
         overall_html = "<b>Overall sentence emotion:</b> not available yet"
+
+    transcript = record.get("text")
+    transcript = transcript.strip() if isinstance(transcript, str) else ""
+    tagged_text = (
+        inject_tags_into_text(transcript, record.get("words"), derived_tags)
+        if transcript
+        else ""
+    )
+    if derived_tags:
+        tag_summary = " ".join(
+            (
+                f"<span class='mb-pill'>{html.escape(tag['tag'])} "
+                f"{_fmt_clock(tag.get('from'))}-{_fmt_clock(tag.get('to'))} "
+                f"{float(tag['score']):.2f}</span>"
+            )
+            for tag in derived_tags
+            if isinstance(tag, dict)
+            and isinstance(tag.get("tag"), str)
+            and _as_float(tag.get("score")) is not None
+        )
+    else:
+        tag_summary = (
+            "<span class='mb-empty'>no tags at current thresholds; "
+            "move min-prob sliders left, reduce min duration, or lower the early-cutoff slider</span>"
+        )
+
+    if tagged_text:
+        tagged_text_html = html.escape(tagged_text)
+    else:
+        tagged_text_html = "<span class='mb-empty'>no transcript text</span>"
 
     container_id = f"mb-{random.randrange(1_000_000_000):x}"
 
@@ -1810,9 +1918,32 @@ def _fmt_timeline_html(
   background: var(--mb-pill-bg);
   border: 1px solid var(--mb-pill-border);
 }}
+.mb-subhead {{
+  font-size: 13px;
+  line-height: 1.45;
+  margin: 0 0 8px 0;
+  padding: 0 2px;
+}}
+.mb-tagged-text {{
+  margin: 6px 0 8px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--mb-border);
+  border-radius: 6px;
+  background: var(--mb-list-bg);
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: normal;
+}}
+.mb-empty {{
+  color: var(--mb-muted);
+  font-style: italic;
+}}
 </style>
 <div class="mb-wrap" id="{container_id}">
   <div class="mb-head">{overall_html}</div>
+  <div class="mb-subhead"><b>Derived tags:</b> {tag_summary}</div>
+  <div class="mb-subhead"><b>Tagged text preview:</b></div>
+  <div class="mb-tagged-text">{tagged_text_html}</div>
   <div class="mb-chart">
     <svg class="mb-svg" viewBox="0 0 {svg_w:.0f} {svg_h:.0f}">
       <line class="mb-scale-line" x1="{x0:.1f}" y1="{emo_y - 10:.1f}" x2="{x0 + xw:.1f}" y2="{emo_y - 10:.1f}" stroke-width="1"/>
@@ -1846,32 +1977,51 @@ def _fmt_timeline_html(
 
 def _fmt_dialect_markdown(record: dict[str, Any]) -> str:
     lines = ["### Dialect"]
-    segment_name = record.get("dialect_segment_name")
-    segment_code = record.get("dialect_segment")
-    speaker_name = record.get("dialect_speaker_majority_name")
-    speaker_code = record.get("dialect_speaker_majority")
+    dialect_name = (
+        record.get("dialect_tag") or record.get("dialect") or record.get("dialect_name")
+    )
+    dialect_code = record.get("dialect_code")
+    dialect_source = record.get("dialect_source")
 
     if (
-        segment_name is not None
-        or segment_code is not None
-        or speaker_name is not None
-        or speaker_code is not None
+        dialect_name is not None
+        or dialect_code is not None
+        or dialect_source is not None
     ):
-        lines.append("Sentence-level prediction:")
         lines.append(
-            f"<div style='font-size: 1.06rem; font-weight: 700; line-height: 1.35;'>"
-            f"{segment_name or '-'} ({segment_code or '-'})"
+            f"<div style='font-size: 1.12rem; font-weight: 800; line-height: 1.35;'>"
+            f"{dialect_name or '-'}"
+            f"{f' ({dialect_code})' if dialect_code is not None else ''}"
             f"</div>"
         )
-        lines.append("")
-        lines.append("Speaker majority over all sentences:")
-        lines.append(
-            f"<div style='font-size: 1.18rem; font-weight: 800; line-height: 1.35;'>"
-            f"{speaker_name or '-'} ({speaker_code or '-'})"
-            f"</div>"
-        )
+        if dialect_source is not None:
+            lines.append(f"Source: `{dialect_source}`")
     else:
-        lines.append("_Not available yet._")
+        segment_name = record.get("dialect_segment_name")
+        segment_code = record.get("dialect_segment")
+        speaker_name = record.get("dialect_speaker_majority_name")
+        speaker_code = record.get("dialect_speaker_majority")
+        if (
+            segment_name is not None
+            or segment_code is not None
+            or speaker_name is not None
+            or speaker_code is not None
+        ):
+            lines.append("Sentence-level prediction:")
+            lines.append(
+                f"<div style='font-size: 1.06rem; font-weight: 700; line-height: 1.35;'>"
+                f"{segment_name or '-'} ({segment_code or '-'})"
+                f"</div>"
+            )
+            lines.append("")
+            lines.append("Speaker majority over all sentences:")
+            lines.append(
+                f"<div style='font-size: 1.18rem; font-weight: 800; line-height: 1.35;'>"
+                f"{speaker_name or '-'} ({speaker_code or '-'})"
+                f"</div>"
+            )
+        else:
+            lines.append("_Not available yet._")
     return "\n".join(lines)
 
 
@@ -1889,6 +2039,7 @@ def _fmt_omni_markdown(record: dict[str, Any]) -> str:
 def _fmt_record_summary(record: dict[str, Any]) -> str:
     podcast, title = _derive_podcast_and_title(record)
     base_text = record.get("text")
+    base_audio_path = record.get("base_audio_path") or record.get("source_audio")
     transcript = (
         base_text
         if isinstance(base_text, str) and base_text.strip()
@@ -1907,6 +2058,7 @@ def _fmt_record_summary(record: dict[str, Any]) -> str:
         f"- Episode: {title or 'Unknown Title'}",
         f"- Speaker: {record.get('speaker', '-')}",
         f"- Time: {_fmt_clock(record.get('start'))} -> {_fmt_clock(record.get('end'))}",
+        f"- Base audio: {base_audio_path or '-'}",
     ]
     return "\n".join(lines)
 
@@ -1918,19 +2070,27 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
         "current_row_id": None,
     }
     fixed_manifest = Path(default_manifest).expanduser()
-    initial_sigh_min_prob = 0.4
-    initial_laughter_min_prob = 0.45
-    initial_laughter_min_duration_s = 1.2
-    initial_chuckle_min_prob = 0.3
-    initial_breathing_min_prob = 0.4
+    initial_min_start_seconds = TAG_DISPLAY_MIN_START_SECONDS
+    initial_sigh_min_prob = DEFAULT_GROUP_MIN_PROB[TAG_GROUP_SIGH]
+    initial_sigh_min_duration_s = DEFAULT_GROUP_MIN_DURATION_S[TAG_GROUP_SIGH]
+    initial_laughter_min_prob = DEFAULT_GROUP_MIN_PROB[TAG_GROUP_LAUGHTER]
+    initial_laughter_min_duration_s = DEFAULT_GROUP_MIN_DURATION_S[TAG_GROUP_LAUGHTER]
+    initial_chuckle_min_prob = DEFAULT_GROUP_MIN_PROB[TAG_GROUP_CHUCKLE]
+    initial_chuckle_min_duration_s = DEFAULT_GROUP_MIN_DURATION_S[TAG_GROUP_CHUCKLE]
+    initial_breathing_min_prob = DEFAULT_GROUP_MIN_PROB[TAG_GROUP_BREATHING]
+    initial_breathing_min_duration_s = DEFAULT_GROUP_MIN_DURATION_S[TAG_GROUP_BREATHING]
 
     def _row_bundle(
         record: dict[str, Any],
+        min_start_seconds: float,
         sigh_min_prob: float,
+        sigh_min_duration_s: float,
         laughter_min_prob: float,
         laughter_min_duration_s: float,
         chuckle_min_prob: float,
+        chuckle_min_duration_s: float,
         breathing_min_prob: float,
+        breathing_min_duration_s: float,
     ):
         audio = str(record.get("audio_path", ""))
         if not audio or not Path(audio).exists():
@@ -1939,11 +2099,15 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
             audio,
             _fmt_timeline_html(
                 record,
+                min_start_seconds=min_start_seconds,
                 sigh_min_prob=sigh_min_prob,
+                sigh_min_duration_s=sigh_min_duration_s,
                 laughter_min_prob=laughter_min_prob,
                 laughter_min_duration_s=laughter_min_duration_s,
                 chuckle_min_prob=chuckle_min_prob,
+                chuckle_min_duration_s=chuckle_min_duration_s,
                 breathing_min_prob=breathing_min_prob,
+                breathing_min_duration_s=breathing_min_duration_s,
             ),
             _fmt_record_summary(record),
             json.dumps(_select_raw_json_fields(record), ensure_ascii=False, indent=2),
@@ -1966,11 +2130,15 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
 
     def _render_row(
         row_id: int,
+        min_start_seconds: float,
         sigh_min_prob: float,
+        sigh_min_duration_s: float,
         laughter_min_prob: float,
         laughter_min_duration_s: float,
         chuckle_min_prob: float,
+        chuckle_min_duration_s: float,
         breathing_min_prob: float,
+        breathing_min_duration_s: float,
     ):
         store = browser.get("store")
         total_rows = int(browser.get("total_rows", 0))
@@ -1982,11 +2150,15 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
         row = store.get_row(row_id)
         audio, timeline_html, summary, raw = _row_bundle(
             row,
+            min_start_seconds,
             sigh_min_prob,
+            sigh_min_duration_s,
             laughter_min_prob,
             laughter_min_duration_s,
             chuckle_min_prob,
+            chuckle_min_duration_s,
             breathing_min_prob,
+            breathing_min_duration_s,
         )
         return (
             _id_markdown(row_id, total_rows),
@@ -2017,11 +2189,15 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
             browser["current_row_id"] = 0
             initial_audio, initial_timeline, initial_summary, initial_raw = _row_bundle(
                 store.get_row(0),
+                initial_min_start_seconds,
                 initial_sigh_min_prob,
+                initial_sigh_min_duration_s,
                 initial_laughter_min_prob,
                 initial_laughter_min_duration_s,
                 initial_chuckle_min_prob,
+                initial_chuckle_min_duration_s,
                 initial_breathing_min_prob,
+                initial_breathing_min_duration_s,
             )
             initial_current_id_md = _id_markdown(0, total)
             initial_jump_value = 0
@@ -2048,19 +2224,34 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
 
         current_id_md = gr.Markdown(initial_current_id_md)
         with gr.Row():
+            min_start_slider = gr.Slider(
+                minimum=0.0,
+                maximum=8.0,
+                step=0.05,
+                value=initial_min_start_seconds,
+                label="Hide events starting before (s)",
+            )
             sigh_prob_slider = gr.Slider(
                 minimum=0.0,
                 maximum=1.0,
                 step=0.05,
                 value=initial_sigh_min_prob,
-                label="Sigh min prob",
+                label="Sigh min prob (lower = more)",
             )
+            sigh_duration_slider = gr.Slider(
+                minimum=0.0,
+                maximum=3.0,
+                step=0.05,
+                value=initial_sigh_min_duration_s,
+                label="Sigh min duration (s)",
+            )
+        with gr.Row():
             laughter_prob_slider = gr.Slider(
                 minimum=0.0,
                 maximum=1.0,
                 step=0.05,
                 value=initial_laughter_min_prob,
-                label="Laughter min prob",
+                label="Laughter min prob (lower = more)",
             )
             laughter_duration_slider = gr.Slider(
                 minimum=0.0,
@@ -2074,14 +2265,29 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
                 maximum=1.0,
                 step=0.05,
                 value=initial_chuckle_min_prob,
-                label="Chuckle/Giggle min prob",
+                label="Chuckle/Giggle min prob (lower = more)",
             )
+            chuckle_duration_slider = gr.Slider(
+                minimum=0.0,
+                maximum=3.0,
+                step=0.05,
+                value=initial_chuckle_min_duration_s,
+                label="Chuckle/Giggle min duration (s)",
+            )
+        with gr.Row():
             breathing_prob_slider = gr.Slider(
                 minimum=0.0,
                 maximum=1.0,
                 step=0.05,
                 value=initial_breathing_min_prob,
-                label="Breathing/Gasp+ min prob",
+                label="Breathing/Gasp+ min prob (lower = more)",
+            )
+            breathing_duration_slider = gr.Slider(
+                minimum=0.0,
+                maximum=3.0,
+                step=0.05,
+                value=initial_breathing_min_duration_s,
+                label="Breathing/Gasp+ min duration (s)",
             )
 
         audio_player = gr.Audio(
@@ -2093,13 +2299,28 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
         timeline_md = gr.HTML(initial_timeline)
         summary_md = gr.Markdown(initial_summary)
         raw_json = gr.Code(label="Raw record JSON", language="json", value=initial_raw)
+        timeline_inputs = [
+            min_start_slider,
+            sigh_prob_slider,
+            sigh_duration_slider,
+            laughter_prob_slider,
+            laughter_duration_slider,
+            chuckle_prob_slider,
+            chuckle_duration_slider,
+            breathing_prob_slider,
+            breathing_duration_slider,
+        ]
 
         def go_prev(
+            min_start_seconds: float,
             sigh_min_prob: float,
+            sigh_min_duration_s: float,
             laughter_min_prob: float,
             laughter_min_duration_s: float,
             chuckle_min_prob: float,
+            chuckle_min_duration_s: float,
             breathing_min_prob: float,
+            breathing_min_duration_s: float,
         ):
             total_rows = int(browser.get("total_rows", 0))
             if total_rows <= 0:
@@ -2108,19 +2329,27 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
             current_id = int(current) if isinstance(current, int) else 0
             return _render_row(
                 current_id - 1,
+                min_start_seconds,
                 sigh_min_prob,
+                sigh_min_duration_s,
                 laughter_min_prob,
                 laughter_min_duration_s,
                 chuckle_min_prob,
+                chuckle_min_duration_s,
                 breathing_min_prob,
+                breathing_min_duration_s,
             )
 
         def go_next(
+            min_start_seconds: float,
             sigh_min_prob: float,
+            sigh_min_duration_s: float,
             laughter_min_prob: float,
             laughter_min_duration_s: float,
             chuckle_min_prob: float,
+            chuckle_min_duration_s: float,
             breathing_min_prob: float,
+            breathing_min_duration_s: float,
         ):
             total_rows = int(browser.get("total_rows", 0))
             if total_rows <= 0:
@@ -2129,20 +2358,28 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
             current_id = int(current) if isinstance(current, int) else 0
             return _render_row(
                 current_id + 1,
+                min_start_seconds,
                 sigh_min_prob,
+                sigh_min_duration_s,
                 laughter_min_prob,
                 laughter_min_duration_s,
                 chuckle_min_prob,
+                chuckle_min_duration_s,
                 breathing_min_prob,
+                breathing_min_duration_s,
             )
 
         def jump_to_id(
             jump_row_id: float | int | None,
+            min_start_seconds: float,
             sigh_min_prob: float,
+            sigh_min_duration_s: float,
             laughter_min_prob: float,
             laughter_min_duration_s: float,
             chuckle_min_prob: float,
+            chuckle_min_duration_s: float,
             breathing_min_prob: float,
+            breathing_min_duration_s: float,
         ):
             total_rows = int(browser.get("total_rows", 0))
             if total_rows <= 0:
@@ -2154,19 +2391,27 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
                 target = int(jump_row_id)
             return _render_row(
                 target,
+                min_start_seconds,
                 sigh_min_prob,
+                sigh_min_duration_s,
                 laughter_min_prob,
                 laughter_min_duration_s,
                 chuckle_min_prob,
+                chuckle_min_duration_s,
                 breathing_min_prob,
+                breathing_min_duration_s,
             )
 
         def go_random(
+            min_start_seconds: float,
             sigh_min_prob: float,
+            sigh_min_duration_s: float,
             laughter_min_prob: float,
             laughter_min_duration_s: float,
             chuckle_min_prob: float,
+            chuckle_min_duration_s: float,
             breathing_min_prob: float,
+            breathing_min_duration_s: float,
         ):
             total_rows = int(browser.get("total_rows", 0))
             if total_rows <= 0:
@@ -2174,19 +2419,27 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
             target = random.randrange(total_rows)
             return _render_row(
                 target,
+                min_start_seconds,
                 sigh_min_prob,
+                sigh_min_duration_s,
                 laughter_min_prob,
                 laughter_min_duration_s,
                 chuckle_min_prob,
+                chuckle_min_duration_s,
                 breathing_min_prob,
+                breathing_min_duration_s,
             )
 
         def refresh_timeline(
+            min_start_seconds: float,
             sigh_min_prob: float,
+            sigh_min_duration_s: float,
             laughter_min_prob: float,
             laughter_min_duration_s: float,
             chuckle_min_prob: float,
+            chuckle_min_duration_s: float,
             breathing_min_prob: float,
+            breathing_min_duration_s: float,
         ):
             store = browser.get("store")
             row_id = browser.get("current_row_id")
@@ -2195,22 +2448,20 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
             row = store.get_row(row_id)
             return _fmt_timeline_html(
                 row,
+                min_start_seconds=min_start_seconds,
                 sigh_min_prob=sigh_min_prob,
+                sigh_min_duration_s=sigh_min_duration_s,
                 laughter_min_prob=laughter_min_prob,
                 laughter_min_duration_s=laughter_min_duration_s,
                 chuckle_min_prob=chuckle_min_prob,
+                chuckle_min_duration_s=chuckle_min_duration_s,
                 breathing_min_prob=breathing_min_prob,
+                breathing_min_duration_s=breathing_min_duration_s,
             )
 
         prev_btn.click(
             go_prev,
-            inputs=[
-                sigh_prob_slider,
-                laughter_prob_slider,
-                laughter_duration_slider,
-                chuckle_prob_slider,
-                breathing_prob_slider,
-            ],
+            inputs=timeline_inputs,
             outputs=[
                 current_id_md,
                 audio_player,
@@ -2222,13 +2473,7 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
         )
         next_btn.click(
             go_next,
-            inputs=[
-                sigh_prob_slider,
-                laughter_prob_slider,
-                laughter_duration_slider,
-                chuckle_prob_slider,
-                breathing_prob_slider,
-            ],
+            inputs=timeline_inputs,
             outputs=[
                 current_id_md,
                 audio_player,
@@ -2240,13 +2485,7 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
         )
         random_btn.click(
             go_random,
-            inputs=[
-                sigh_prob_slider,
-                laughter_prob_slider,
-                laughter_duration_slider,
-                chuckle_prob_slider,
-                breathing_prob_slider,
-            ],
+            inputs=timeline_inputs,
             outputs=[
                 current_id_md,
                 audio_player,
@@ -2258,14 +2497,7 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
         )
         jump_btn.click(
             jump_to_id,
-            inputs=[
-                jump_id_input,
-                sigh_prob_slider,
-                laughter_prob_slider,
-                laughter_duration_slider,
-                chuckle_prob_slider,
-                breathing_prob_slider,
-            ],
+            inputs=[jump_id_input, *timeline_inputs],
             outputs=[
                 current_id_md,
                 audio_player,
@@ -2275,61 +2507,10 @@ def create_app(default_manifest: str = DEFAULT_MANIFEST) -> gr.Blocks:
                 jump_id_input,
             ],
         )
-        sigh_prob_slider.change(
-            refresh_timeline,
-            inputs=[
-                sigh_prob_slider,
-                laughter_prob_slider,
-                laughter_duration_slider,
-                chuckle_prob_slider,
-                breathing_prob_slider,
-            ],
-            outputs=[timeline_md],
-        )
-        laughter_prob_slider.change(
-            refresh_timeline,
-            inputs=[
-                sigh_prob_slider,
-                laughter_prob_slider,
-                laughter_duration_slider,
-                chuckle_prob_slider,
-                breathing_prob_slider,
-            ],
-            outputs=[timeline_md],
-        )
-        laughter_duration_slider.change(
-            refresh_timeline,
-            inputs=[
-                sigh_prob_slider,
-                laughter_prob_slider,
-                laughter_duration_slider,
-                chuckle_prob_slider,
-                breathing_prob_slider,
-            ],
-            outputs=[timeline_md],
-        )
-        chuckle_prob_slider.change(
-            refresh_timeline,
-            inputs=[
-                sigh_prob_slider,
-                laughter_prob_slider,
-                laughter_duration_slider,
-                chuckle_prob_slider,
-                breathing_prob_slider,
-            ],
-            outputs=[timeline_md],
-        )
-        breathing_prob_slider.change(
-            refresh_timeline,
-            inputs=[
-                sigh_prob_slider,
-                laughter_prob_slider,
-                laughter_duration_slider,
-                chuckle_prob_slider,
-                breathing_prob_slider,
-            ],
-            outputs=[timeline_md],
-        )
+        for slider in timeline_inputs:
+            slider.change(
+                refresh_timeline, inputs=timeline_inputs, outputs=[timeline_md]
+            )
 
     return app
 
