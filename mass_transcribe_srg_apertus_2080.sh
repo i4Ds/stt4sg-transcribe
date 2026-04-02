@@ -1,16 +1,20 @@
 #!/bin/bash
 #SBATCH --time=144:00:00
 #SBATCH --cpus-per-task=8
-#SBATCH --job-name=srg_apertus_v2
+#SBATCH --job-name=srg_apertus_json
 #SBATCH --mem=32G
-#SBATCH --gres=gpu:rtx2080:1
+#SBATCH --gres=gpu:1
 #SBATCH --partition=performance
 #SBATCH --nodes=1
-#SBATCH --nodelist=calc-g-002,calc-g-003,calc-g-004
-#SBATCH --out=logs/srg_apertus_v2_%j.out
-#SBATCH --error=logs/srg_apertus_v2_%j.err
+#SBATCH --nodelist=calc-g-002,calc-g-003,calc-g-004,calc-g-006
+#SBATCH --array=1-4
+#SBATCH --out=logs/srg_apertus_json_%A_%a.out
+#SBATCH --error=logs/srg_apertus_json_%A_%a.err
 
 set -euo pipefail
+
+MODEL="i4ds/whisper-large-v3-srg-v2-full-mc-de-sg-corpus"
+TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 
 CONDA_BASE=""
 if command -v conda >/dev/null 2>&1; then
@@ -38,31 +42,22 @@ ROOT="/mnt/nas05/data01/vincenzo/SRG_apertus"
 [ -d "${ROOT}" ] || { echo "Input path not found: ${ROOT}"; exit 1; }
 
 echo "Host: $(hostname)"
+echo "Array task: ${TASK_ID}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 echo "Input root: ${ROOT}"
-echo "Model: whisper-large-v2"
+echo "Model: ${MODEL}"
+echo "Diarization: pyannote"
+echo "Output: JSON only"
 
 python -u batch_transcribe.py "${ROOT}" \
-    --model large-v2 \
+    --model "${MODEL}" \
     --device cuda \
     --compute-type float16 \
-    --srt-only \
-    --srt-in-place \
-    --skip-existing \
+    --diarization \
+    --no-srt \
+    --skip-if-exist \
     --vad-method silero \
     --vad-params '{"threshold": 0.5, "neg_threshold": 0.365}' \
     --no-logs \
-    --add_lock
-
-
-python -u batch_transcribe.py "${ROOT}" \
-    --model large-v2 \
-    --device cuda \
-    --compute-type float16 \
-    --srt-only \
-    --srt-in-place \
-    --skip-existing \
-    --vad-method silero \
-    --vad-params '{"threshold": 0.5, "neg_threshold": 0.365}' \
-    --no-logs \
+    --tqdm \
     --add_lock

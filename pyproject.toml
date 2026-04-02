@@ -5,6 +5,7 @@ description = "Speech-to-Text transcription with Faster-Whisper, PyAnnote VAD/di
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "backoff>=2.2.1",
     "faster-whisper>=1.2.1",
     "librosa>=0.10.2",
     "nemo-toolkit[asr]>=2.6.1",
@@ -21,7 +22,7 @@ dependencies = [
     "speechbrain>=1.0.3",
     "torch>=2.8.0",
     "torchaudio>=2.8.0",
-    "omnilingual-asr>=0.1.0",
+    "openai>=1.109.1",
 ]
 
 [build-system]

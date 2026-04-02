@@ -100,6 +100,7 @@ class TranscriptionConfig:
     use_alignment: bool = True
     alignment_model: Optional[str] = None
 
+    generate_srt: bool = True
     include_speaker_labels: bool = True
     hf_token: Optional[str] = None
 
@@ -382,22 +383,30 @@ class TranscriptionPipeline:
 
         results["final_segments"] = final_segments
 
-        # Step 6: Generate SRT
-        logger.info("Step 6: Generating SRT...")
-        output_path = (
-            output_path if output_path else self.output_dir / f"{base_name}.srt"
-        )
-        srt_content = segments_to_srt(
-            final_segments,
-            output_path,
-            include_speaker=self.config.include_speaker_labels
-            and self.config.use_diarization,
-        )
-        results["srt_path"] = str(output_path)
-        results["srt_content"] = srt_content
+        if self.config.generate_srt:
+            # Step 6: Generate SRT
+            logger.info("Step 6: Generating SRT...")
+            output_path = (
+                output_path if output_path else self.output_dir / f"{base_name}.srt"
+            )
+            srt_content = segments_to_srt(
+                final_segments,
+                output_path,
+                include_speaker=self.config.include_speaker_labels
+                and self.config.use_diarization,
+            )
+            results["srt_path"] = str(output_path)
+            results["srt_content"] = srt_content
+        else:
+            logger.info("Step 6: Skipping SRT generation")
+            results["srt_path"] = None
+            results["srt_content"] = None
         results["log_dir"] = str(run_log_dir) if save_logs else None
 
-        logger.info(f"Done! SRT: {output_path}")
+        if results["srt_path"]:
+            logger.info(f"Done! SRT: {results['srt_path']}")
+        else:
+            logger.info("Done! No SRT generated")
         if save_logs:
             logger.info(f"Logs: {run_log_dir}")
 

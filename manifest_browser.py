@@ -2025,17 +2025,6 @@ def _fmt_dialect_markdown(record: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _fmt_omni_markdown(record: dict[str, Any]) -> str:
-    lines = ["### Omni Transcription"]
-
-    omni_text = record.get("omni_text")
-    if isinstance(omni_text, str) and omni_text:
-        lines.append(omni_text)
-    else:
-        lines.append("_Not available yet._")
-    return "\n".join(lines)
-
-
 def _fmt_record_summary(record: dict[str, Any]) -> str:
     podcast, title = _derive_podcast_and_title(record)
     base_text = record.get("text")
@@ -2048,8 +2037,6 @@ def _fmt_record_summary(record: dict[str, Any]) -> str:
     lines = [
         "### Transcript",
         transcript,
-        "",
-        _fmt_omni_markdown(record),
         "",
         _fmt_dialect_markdown(record),
         "",

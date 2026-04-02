@@ -40,34 +40,6 @@ Or pass it via `--hf-token` argument.
 
 ## Usage
 
-### Omni Context Transcription (Dialect-Aware)
-
-`omni_context_transcribe.py` runs `omnilingual-asr` with 10-shot in-context examples sampled from a local Hugging Face dataset (`load_from_disk` format).
-
-It supports:
-- reading `manifest.jsonl` input rows,
-- grouping rows by dialect (`dialect`/`dialect_tag`/`client_id`),
-- sampling random dialect-matched context examples (default: 10),
-- batched `transcribe_with_context(...)` per dialect batch.
-
-Example:
-
-```bash
-uv run omni_context_transcribe.py \
-  /mnt/nas05/data02/vincenzo/podcast_data/youtube/processed/manifest.jsonl \
-  --hf-dataset-path /home2/vincenzo/stt4sg-transcribe/all \
-  --model-card omniASR_LLM_7B_ZS \
-  --batch-size 256 \
-  --context-size 10 \
-  --dialect-aliases BS=bs,ZH=zh \
-  --output /mnt/nas05/data02/vincenzo/podcast_data/youtube/processed/manifest.omni.jsonl
-```
-
-Notes:
-- The manifest must provide an audio path field (`audio_path` by default).
-- If dialect is not yet present in the manifest, use `--default-dialect ...`.
-- For quick validation without model inference, use `--dry-run --limit 20`.
-
 ### Basic Usage
 
 ```bash

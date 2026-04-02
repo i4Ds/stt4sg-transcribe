@@ -75,10 +75,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "inputs",
         nargs="+",
         metavar="INPUT",
-        help=(
-            "Either: manifest emotion dialect tagged "
-            "or legacy: manifest emotion omni dialect tagged"
-        ),
+        help="manifest emotion dialect tagged",
     )
     parser.add_argument(
         "-o",
@@ -89,20 +86,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
 
-    if len(args.inputs) == 4:
-        manifest, emotion, dialect, tagged = args.inputs
-        omni = None
-    elif len(args.inputs) == 5:
-        manifest, emotion, omni, dialect, tagged = args.inputs
-    else:
+    if len(args.inputs) != 4:
         parser.error(
-            "Expected 4 inputs (manifest emotion dialect tagged) "
-            "or 5 inputs for legacy mode (manifest emotion omni dialect tagged)."
+            "Expected 4 inputs: manifest emotion dialect tagged."
         )
+    manifest, emotion, dialect, tagged = args.inputs
 
     args.manifest = Path(manifest)
     args.emotion = Path(emotion)
-    args.omni = Path(omni) if omni else None
     args.dialect = Path(dialect)
     args.tagged = Path(tagged)
     return args
@@ -596,8 +587,6 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Wrote: {output_path}")
     print(f"Rows processed: {rows}")
     print(f"Rows written: {written_rows}")
-    if args.omni is not None:
-        print(f"Legacy omni input ignored: {args.omni}", file=sys.stderr)
     return 0
 
 
