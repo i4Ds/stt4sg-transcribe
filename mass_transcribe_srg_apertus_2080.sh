@@ -1,15 +1,15 @@
 #!/bin/bash
 #SBATCH --time=144:00:00
 #SBATCH --cpus-per-task=8
-#SBATCH --job-name=srg_apertus_json
+#SBATCH --job-name=srg_apertus_batch
 #SBATCH --mem=32G
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:rtx3080:1
 #SBATCH --partition=performance
 #SBATCH --nodes=1
 #SBATCH --nodelist=calc-g-002,calc-g-003,calc-g-004,calc-g-006
 #SBATCH --array=1-4
-#SBATCH --out=logs/srg_apertus_json_%A_%a.out
-#SBATCH --error=logs/srg_apertus_json_%A_%a.err
+#SBATCH --out=logs/srg_apertus_batch_%A_%a.out
+#SBATCH --error=logs/srg_apertus_batch_%A_%a.err
 
 set -euo pipefail
 
@@ -47,14 +47,14 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 echo "Input root: ${ROOT}"
 echo "Model: ${MODEL}"
 echo "Diarization: pyannote"
-echo "Output: JSON only"
+echo "Output: JSON + SRT"
 
 python -u batch_transcribe.py "${ROOT}" \
     --model "${MODEL}" \
     --device cuda \
     --compute-type float16 \
     --diarization \
-    --no-srt \
+    --srt-in-place \
     --skip-if-exist \
     --vad-method silero \
     --vad-params '{"threshold": 0.5, "neg_threshold": 0.365}' \

@@ -5,10 +5,12 @@ This step:
 - derives sentence-level emotion from `emotion_frames`
 - derives filtered canonical non-speech `tags` from `audio_tag_frames`
 - injects tags into `text` using word timings when available
+- optionally merges `sentence_ch` from a keyed JSONL
 - emits a compact output schema:
   - audio_path
   - base_audio_path
   - text
+    - sentence_ch
   - emotion
   - dialect_tag
   - tags
@@ -25,9 +27,12 @@ from pathlib import Path
 from typing import Any
 
 from combine_manifests import (
+    _build_audio_index,
+    _lookup_audio,
     _missing_csv_row,
     derive_overall_emotion,
     derive_tag_events,
+    read_jsonl,
 )
 
 
@@ -47,6 +52,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=Path("manifest_final_missing.csv"),
         help="CSV report path for skipped rows.",
     )
+    parser.add_argument(
+        "--sentence-ch-jsonl",
+        type=Path,
+        default=None,
+        help="Optional JSONL with audio_path and sentence_ch to merge into the output.",
+    )
     return parser.parse_args(argv)
 
 
@@ -56,6 +67,10 @@ def resolve_output_path(input_path: Path, output_arg: Path) -> Path:
 
 def resolve_report_path(input_path: Path, report_arg: Path) -> Path:
     return report_arg if report_arg.is_absolute() else input_path.parent / report_arg
+
+
+def resolve_input_path(input_path: Path, path_arg: Path) -> Path:
+    return path_arg if path_arg.is_absolute() else input_path.parent / path_arg
 
 
 def _as_float(value: Any) -> float | None:
@@ -90,6 +105,21 @@ def _extract_base_audio_path(row: dict[str, Any]) -> str | None:
         if value:
             return value
     return None
+
+
+def build_sentence_ch_index(path: Path) -> dict[str, Any]:
+    sentence_by_audio: dict[str, str] = {}
+    for row in read_jsonl(path):
+        audio_path = row.get("audio_path")
+        sentence_ch = row.get("sentence_ch")
+        if not isinstance(audio_path, str) or not audio_path:
+            continue
+        if not isinstance(sentence_ch, str):
+            continue
+        sentence_ch = sentence_ch.strip()
+        if sentence_ch:
+            sentence_by_audio[audio_path] = sentence_ch
+    return _build_audio_index(sentence_by_audio)
 
 
 def _normalized_word_tokens(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -190,6 +220,13 @@ def main(argv: list[str] | None = None) -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.parent.mkdir(parents=True, exist_ok=True)
 
+    sentence_ch_index: dict[str, Any] | None = None
+    if args.sentence_ch_jsonl is not None:
+        sentence_ch_path = resolve_input_path(args.input, args.sentence_ch_jsonl)
+        if not sentence_ch_path.exists():
+            raise FileNotFoundError(f"Missing sentence_ch JSONL: {sentence_ch_path}")
+        sentence_ch_index = build_sentence_ch_index(sentence_ch_path)
+
     processed = 0
     written = 0
     skipped = 0
@@ -250,9 +287,24 @@ def main(argv: list[str] | None = None) -> int:
             dialect_tag = _extract_dialect_tag(row)
             base_audio_path = _extract_base_audio_path(row)
             dnsmos_sig, dnsmos_bak = _extract_dnsmos(row)
+            sentence_ch = None
+            if sentence_ch_index is not None:
+                looked_up_sentence = _lookup_audio(sentence_ch_index, audio_path)
+                if isinstance(looked_up_sentence, str):
+                    looked_up_sentence = looked_up_sentence.strip()
+                    if looked_up_sentence:
+                        sentence_ch = looked_up_sentence
+            if sentence_ch is None:
+                existing_sentence_ch = row.get("sentence_ch")
+                if isinstance(existing_sentence_ch, str):
+                    existing_sentence_ch = existing_sentence_ch.strip()
+                    if existing_sentence_ch:
+                        sentence_ch = existing_sentence_ch
+
             payload = {
                 "audio_path": audio_path,
                 "text": final_text,
+                "sentence_ch": sentence_ch,
                 "emotion": emotion_label.upper(),
                 "tags": tags,
             }
@@ -264,6 +316,8 @@ def main(argv: list[str] | None = None) -> int:
                 payload["dnsmos_sig"] = round(dnsmos_sig, 4)
             if dnsmos_bak is not None:
                 payload["dnsmos_bak"] = round(dnsmos_bak, 4)
+            if payload["sentence_ch"] is None:
+                del payload["sentence_ch"]
             out.write(json.dumps(payload, ensure_ascii=False) + "\n")
             written += 1
 

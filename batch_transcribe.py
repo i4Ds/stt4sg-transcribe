@@ -292,7 +292,6 @@ def main() -> None:
         max_speakers=args.max_speakers,
         use_alignment=not args.no_alignment,
         alignment_model=args.alignment_model,
-        generate_srt=not args.no_srt,
         include_speaker_labels=args.diarization,
         hf_token=hf_token,
     )
